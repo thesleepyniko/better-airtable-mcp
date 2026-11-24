@@ -275,8 +275,8 @@ func (s *Service) PrepareMutation(ctx context.Context, userID string, request Mu
 			return fail(fmt.Errorf("unknown table %q; available tables: %s", operation.Table, strings.Join(suggestions(operation.Table, tableNames), ", ")))
 		}
 
-		if table.SyncStatus == duckdb.TableSyncSchemaOnly && operation.Type != "create_records" {
-			return fail(fmt.Errorf("table %q is schema-only on this server: its records are withheld from agents, so they cannot be previewed for %s", table.DuckDBTableName, operation.Type))
+		if table.SyncStatus == duckdb.TableSyncSchemaOnly {
+			return fail(fmt.Errorf("table %q is schema-only on this server: agents may see its fields but cannot read or write its records", table.DuckDBTableName))
 		}
 		fieldNames := collectFieldAliases(table.Fields)
 

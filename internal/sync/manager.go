@@ -120,6 +120,11 @@ func (m *Manager) RestoreActiveWorkers(ctx context.Context) error {
 	return nil
 }
 
+// ErrStalePolicyCache marks a cache built under a different field policy that
+// could not be deleted. Serving it could expose data the current policy
+// hides, so the server must not start.
+var ErrStalePolicyCache = errors.New("could not remove a duckdb cache built under a different field policy")
+
 func (m *Manager) SweepStaleDuckDBFiles(ctx context.Context) error {
 	if m == nil || m.service == nil || m.store == nil {
 		return nil
@@ -160,6 +165,13 @@ func (m *Manager) SweepStaleDuckDBFiles(ctx context.Context) error {
 				continue
 			}
 			logx.Event(ctx, "sync_manager", "sync.field_policy_cache_discarded", "base_id", baseID)
+			// Its write-ahead log goes too, or a new file could replay it.
+			for _, name := range []string{entry.Name(), entry.Name() + ".wal"} {
+				if err := os.Remove(filepath.Join(m.service.dataDir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+					removeErr = errors.Join(removeErr, fmt.Errorf("%w: %s: %v", ErrStalePolicyCache, name, err))
+				}
+			}
+			continue
 		}
 
 		if err := os.Remove(filepath.Join(m.service.dataDir, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {

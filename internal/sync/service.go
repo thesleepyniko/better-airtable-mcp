@@ -450,12 +450,18 @@ func (s *Service) runSync(ctx context.Context, tokens AccessTokenFunc, base Base
 		return SyncResult{}, err
 	}
 
+	// A policy key that matches nothing usually means a table or field was
+	// renamed or retyped in Airtable, which would silently expose it. Refuse
+	// to sync until the operator fixes the policy; the last snapshot, built
+	// while the key still matched, keeps serving reads. The agent-facing error
+	// does not name the keys, since they can name hidden fields.
 	if unmatched := s.fieldPolicy.UnmatchedKeys(base.ID, policyTableRefs(tables)); len(unmatched) > 0 {
 		logx.Event(ctx, "sync_service", "sync.field_policy_unmatched",
 			"base_id", base.ID,
 			"unmatched_count", len(unmatched),
 			"unmatched_keys", strings.Join(unmatched, ", "),
 		)
+		return SyncResult{}, fmt.Errorf("base %s no longer matches this server's field policy (%d rule(s) match no table or field); the server operator must update FIELD_POLICY before it can sync", base.ID, len(unmatched))
 	}
 	plans, err := buildSyncPlans(base.ID, tables, s.fieldPolicy)
 	if err != nil {
@@ -829,7 +835,7 @@ func policyTableRefs(tables []Table) []fieldpolicy.TableRef {
 	for _, table := range tables {
 		ref := fieldpolicy.TableRef{ID: table.ID, Name: table.Name}
 		for _, field := range table.Fields {
-			ref.Fields = append(ref.Fields, fieldpolicy.FieldRef{ID: field.ID, Name: field.Name, References: field.referencedFieldIDs()})
+			ref.Fields = append(ref.Fields, field.policyRef())
 		}
 		refs = append(refs, ref)
 	}

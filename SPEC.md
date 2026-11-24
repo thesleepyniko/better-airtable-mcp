@@ -473,7 +473,7 @@ For `delete_records`, `records` may be either objects containing `id` or plain A
 - After approval, executes against the Airtable API using the requesting user's Airtable token, never a shared sync token
 - After execution, partial completion, or failure, triggers an immediate base sync
 - Fields hidden by the field policy (§4.7) do not resolve by column name, original name, or Airtable field ID; the request fails as an unknown field and the suggestions list only visible fields
-- On a schema-only table (§4.7), `update_records` and `delete_records` are refused, since its records cannot be read for the preview; `create_records` goes through approval as usual
+- On a schema-only table (§4.7), every operation (`create_records`, `update_records`, `delete_records`) is refused
 - Rejects any field value containing a redaction placeholder (`[REDACTED]`, `[REDACTED_EMAIL]`, …): the cache only holds redacted copies, so writing one back would overwrite the real Airtable data
 
 ---
@@ -609,6 +609,7 @@ field to "deprecated" and calls it a deletion).
 - On approval, executes one meta API call per operation, sequentially, using the
   requesting user's Airtable token. A mid-sequence failure yields `partially_completed`.
 - Schema changes restructure the base, so execution triggers a full base re-sync.
+- When a field policy is configured, creating computed fields (`formula`, `rollup`, `lookup`/`multipleLookupValues`, `count`) is refused, in `create_field` and inside `create_table`: a computed field reads other fields server-side, so an agent could build one that copies a hidden or schema-only value, or rewrites a redacted value past the detectors.
 - Hidden fields (§4.7) cannot be referenced. Renaming a table the field policy names, or a field it names
   specifically (hidden or with a field-level redaction rule), is refused: a rename would silently detach
   a name-keyed rule. Description-only edits are allowed.
@@ -825,8 +826,13 @@ The server operator can keep specific fields away from agents entirely and redac
 
 - **Keys**: bases are keyed by base ID. Tables and fields match by Airtable ID or, case-insensitively, by name; every matching table entry applies. IDs survive renames in Airtable, so prefer them.
 - **`hidden_fields`** (field gating): the sync drops these fields from the schema before DuckDB columns are named, and drops their values from every fetched record before anything is written. They get no column, no `_metadata` row, and leave no gap in neighbouring column names, so `list_schema`, `query` (including `SELECT *`), `mutate`, `manage_schema`, and the approval preview never see them.
-- **`schema_only`** (on a base, for all its tables, or on one table): the agent sees the table's fields but none of its records. The sync creates the empty table and never fetches its records; `_table_sync.sync_status` is `schema_only`, queries on it return no rows, and `list_schema` labels it.
-- **Computed fields follow their inputs**: Airtable's field `options` list what a formula (`referencedFieldIds`), rollup, lookup, or count (`recordLinkFieldId`, `fieldIdInLinkedTable`) reads. A computed field that reads a hidden field, or a field of another table that is schema-only, is hidden too; one that reads redacted fields inherits their detectors. Both follow chains of computed fields across tables.
+- **`schema_only`** (on a base, for all its tables, or on one table): the agent sees the table's fields but none of its records, and cannot write to it. The sync creates the empty table and never fetches its records; `_table_sync.sync_status` is `schema_only`, queries on it return no rows, and `list_schema` labels it.
+- **Derived fields fail closed.** Airtable's field `options` list what a formula (`referencedFieldIds`), rollup, lookup, or count (`recordLinkFieldId`, `fieldIdInLinkedTable`) reads. On top of the configured rules, the server hides:
+  - link fields into another table that is schema-only (they expose its record IDs and feed lookups and counts);
+  - computed fields whose options do not say what they read;
+  - computed fields that read a hidden field, or a field of another schema-only table;
+  - lookups, rollups, and counts through a link into a table that has any hidden field, since their record conditions are not exposed by the API and could filter on that field.
+  A computed field that reads any redacted text field is redacted with `full`, because a formula can rewrite a value (`SUBSTITUTE({Email}, "@", " at ")`) so no pattern finds it. All of these follow chains of computed fields, in any order and across tables. With a global `redact` list this fully redacts every formula over text.
 - **`redact`** (PII redaction): detectors apply to every value written to the cache. Effective detectors for a field are the union of the top-level `redact` list (every field of every base), the table's `"*"` rule, and the field's own rule.
 
 | Detector | Replaces with | Matches |
@@ -842,16 +848,16 @@ The server operator can keep specific fields away from agents entirely and redac
 **Behavior:**
 - Redaction runs on strings, including those nested in lookups, attachments, and collaborator objects; numbers, booleans, and object keys are left alone by pattern detectors.
 - Redaction happens at sync time, not when results are returned, so SQL cannot undo it (`replace(email, '@', ' at ')` only sees the placeholder). The cost is that the approval preview's current values are redacted too.
-- Unknown keys, unknown detectors, and non-`app` base keys fail startup, so a typo cannot silently expose a field. Policy keys that match no table or field in a synced base are logged on every sync as `sync.field_policy_unmatched`.
-- Each snapshot records the policy fingerprint in `_field_policy`. At startup the stale-file sweep also deletes active caches built under a different policy (or whose policy cannot be read), and the restored worker rebuilds them under the current one.
+- Unknown keys, unknown detectors, and non-`app` base keys fail startup, so a typo cannot silently expose a field.
+- A policy key that matches no table or field in the base's current schema (usually a rename in Airtable) stops that base's sync: the run fails before writing anything, logs `sync.field_policy_unmatched` with the keys, and tells the agent only that the operator must update `FIELD_POLICY`. The last snapshot, built while the key still matched, keeps serving reads. Prefer IDs as keys; they survive renames.
+- Each snapshot records the policy fingerprint in `_field_policy`. At startup the stale-file sweep also deletes active caches (and their `.wal` files) built under a different policy or whose policy cannot be read, and the restored worker rebuilds them under the current one. If such a file cannot be deleted, the server exits rather than serve it.
 - `mutate` refuses values containing redaction placeholders, and `manage_schema` refuses to rename policy-covered tables and fields (§3.4, §3.7).
 - The policy is per deployment, matching the shared per-base cache (§4.6): it applies to every user of the base.
 
 **Limits:**
-- Link fields into a schema-only table, and counts over them, stay visible: they expose record IDs and counts, not field values.
-- A computed field that only partially copies a redacted value (`LEFT({Email}, 3)`) inherits the detectors, but a pattern cannot recognise the fragment; use `full` on the source field when that matters.
-- Pattern detection is best-effort and cannot find names or postal addresses; use `full` for those fields.
-- Deleting a record removes its hidden fields' values along with it.
+- Pattern detection is best-effort and cannot find names or postal addresses in ordinary text fields; use `full` for those.
+- Attachment files and their URLs are not inspected; hide attachment fields that hold sensitive documents.
+- Deleting a record removes its hidden fields' values along with it, and `manage_schema` errors from Airtable (for example a duplicate field name) can reveal that a hidden field with that name exists, though not its values.
 
 ---
 

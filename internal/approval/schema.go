@@ -185,6 +185,23 @@ func (s *Service) PrepareSchemaMutation(ctx context.Context, userID string, requ
 		MCPClientName: strings.TrimSpace(request.ClientName),
 	}
 
+	// A computed field reads other fields server-side, so under a field policy
+	// an agent could build one that exposes a hidden or schema-only value, or
+	// rewrites a redacted one past the detectors. Only people may add them.
+	if s.syncer.FieldPolicy() != nil {
+		for i, op := range request.Operations {
+			types := []string{op.FieldType}
+			for _, field := range op.Fields {
+				types = append(types, field.Type)
+			}
+			for _, fieldType := range types {
+				if syncer.IsComputedFieldType(strings.TrimSpace(fieldType)) {
+					return fail(fmt.Errorf("operations[%d]: this server has a field policy, so computed fields (formula, rollup, lookup, count) cannot be created through manage_schema; add them in Airtable by hand", i))
+				}
+			}
+		}
+	}
+
 	for i, op := range request.Operations {
 		switch strings.TrimSpace(op.Type) {
 		case schemaCreateTable:

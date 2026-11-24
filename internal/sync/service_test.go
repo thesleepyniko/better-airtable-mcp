@@ -166,7 +166,8 @@ func (c *policyTestClient) GetBaseSchema(ctx context.Context, accessToken, baseI
 			{ID: "fldSalary", Name: "Salary", Type: "currency"},
 			{ID: "fldNotes", Name: "Notes", Type: "multilineText"},
 			{ID: "fldScore", Name: "Score", Type: "number"},
-			{ID: "fldTags", Name: "Tags", Type: "lookup"},
+			{ID: "fldTags", Name: "Tags", Type: "lookup", Options: map[string]any{"recordLinkFieldId": "fldOtherLink", "fieldIdInLinkedTable": "fldOther"}},
+			{ID: "fldOpaque", Name: "Opaque", Type: "formula"},
 		},
 	}}, nil
 }
@@ -210,6 +211,7 @@ func TestSyncKeepsHiddenFieldsAndRawPIIOutOfTheCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SELECT * returned error: %v", err)
 	}
+	// Opaque is a formula with no options, so its inputs are unknown: hidden.
 	wantColumns := []string{"id", "created_time", "name", "notes", "score", "tags"}
 	if !reflect.DeepEqual(result.Columns, wantColumns) {
 		t.Fatalf("SELECT * columns = %v, want %v", result.Columns, wantColumns)
@@ -327,11 +329,11 @@ func TestSyncHidesDerivedFieldsAndWithholdsSchemaOnlyTables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SELECT * FROM people returned error: %v", err)
 	}
-	if want := []string{"id", "created_time", "name", "email", "greeting", "payslips"}; !reflect.DeepEqual(people.Columns, want) {
-		t.Fatalf("people columns = %v, want %v (formula over SSN and rollup over Payroll hidden)", people.Columns, want)
+	if want := []string{"id", "created_time", "name", "email", "greeting"}; !reflect.DeepEqual(people.Columns, want) {
+		t.Fatalf("people columns = %v, want %v (formula over SSN, link into schema-only Payroll, and rollup over it hidden)", people.Columns, want)
 	}
-	if greeting := people.Rows[0][4]; greeting != "Hi Ada <[REDACTED_EMAIL]>" {
-		t.Fatalf("greeting = %#v, want the formula to inherit Email's redaction", greeting)
+	if greeting := people.Rows[0][4]; greeting != "[REDACTED]" {
+		t.Fatalf("greeting = %#v, want a formula over redacted Email fully redacted", greeting)
 	}
 
 	payroll, err := service.QueryResolvedBase(ctx, "appPeople", "SELECT * FROM payroll")
@@ -349,5 +351,37 @@ func TestSyncHidesDerivedFieldsAndWithholdsSchemaOnlyTables(t *testing.T) {
 		if table.DuckDBTableName == "payroll" && table.SyncStatus != duckdb.TableSyncSchemaOnly {
 			t.Fatalf("payroll sync status = %q, want %q", table.SyncStatus, duckdb.TableSyncSchemaOnly)
 		}
+	}
+}
+
+type renamedFieldClient struct{ policyTestClient }
+
+func (c *renamedFieldClient) GetBaseSchema(ctx context.Context, accessToken, baseID string) ([]Table, error) {
+	tables, _ := c.policyTestClient.GetBaseSchema(ctx, accessToken, baseID)
+	for index := range tables[0].Fields {
+		if tables[0].Fields[index].Name == "SSN" {
+			tables[0].Fields[index].Name = "Social Security Number"
+		}
+	}
+	return tables, nil
+}
+
+func TestSyncRefusesWhenAPolicyKeyNoLongerMatches(t *testing.T) {
+	policy, err := fieldpolicy.Parse([]byte(`{"bases": {"appPeople": {"tables": {"Contacts": {"hidden_fields": ["SSN"]}}}}}`))
+	if err != nil {
+		t.Fatalf("Parse() returned error: %v", err)
+	}
+	client := &renamedFieldClient{policyTestClient{countingBasesClient{bases: []Base{{ID: "appPeople", Name: "People"}}}}}
+	service := NewService(client, t.TempDir())
+	service.SetFieldPolicy(policy)
+	_, err = service.SyncBase(context.Background(), "token", "appPeople")
+	if err == nil || !strings.Contains(err.Error(), "field policy") {
+		t.Fatalf("a renamed hidden field must stop the sync, got %v", err)
+	}
+	if strings.Contains(err.Error(), "SSN") {
+		t.Fatalf("the agent-facing error must not name the hidden field: %v", err)
+	}
+	if duckdb.DatabaseFileExists(service.DatabasePath("appPeople")) {
+		t.Fatal("no cache may be written while the policy does not match")
 	}
 }

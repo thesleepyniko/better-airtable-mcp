@@ -20,6 +20,7 @@ import (
 
 	"golang.org/x/time/rate"
 
+	"github.com/hackclub/better-airtable-mcp/internal/fieldpolicy"
 	"github.com/hackclub/better-airtable-mcp/internal/logx"
 )
 
@@ -127,24 +128,48 @@ type Field struct {
 	Options     map[string]any `json:"options,omitempty"`
 }
 
-// referencedFieldIDs lists the fields a computed field reads, from its
-// Airtable options: formula and rollup inputs, and the link and linked-table
-// field behind a lookup, rollup, or count.
-func (f Field) referencedFieldIDs() []string {
-	var refs []string
-	for _, key := range []string{"recordLinkFieldId", "fieldIdInLinkedTable"} {
-		if id, ok := f.Options[key].(string); ok && id != "" {
-			refs = append(refs, id)
+// computedFieldTypes are the field types whose values Airtable derives from
+// other fields.
+var computedFieldTypes = map[string]bool{
+	"formula": true, "rollup": true, "lookup": true, "multipleLookupValues": true, "count": true,
+}
+
+// IsComputedFieldType reports whether Airtable derives a field type's values
+// from other fields.
+func IsComputedFieldType(fieldType string) bool {
+	return computedFieldTypes[fieldType]
+}
+
+// policyRef describes the field for the field policy: what it links to, and
+// for a computed field, which fields it reads according to its options
+// (formula and rollup inputs, and the link and linked-table field behind a
+// lookup, rollup, or count). known is false when the options are missing
+// what the type needs, so the policy can fail closed.
+func (f Field) policyRef() fieldpolicy.FieldRef {
+	ref := fieldpolicy.FieldRef{ID: f.ID, Name: f.Name, Type: f.Type, Computed: computedFieldTypes[f.Type]}
+	ref.LinkedTableID, _ = f.Options["linkedTableId"].(string)
+	if !ref.Computed {
+		return ref
+	}
+	ids, hasIDs := f.Options["referencedFieldIds"].([]any)
+	for _, raw := range ids {
+		if id, ok := raw.(string); ok && id != "" {
+			ref.References = append(ref.References, id)
 		}
 	}
-	if ids, ok := f.Options["referencedFieldIds"].([]any); ok {
-		for _, raw := range ids {
-			if id, ok := raw.(string); ok && id != "" {
-				refs = append(refs, id)
-			}
-		}
+	link, hasLink := f.Options["recordLinkFieldId"].(string)
+	if hasLink && link != "" {
+		ref.References = append(ref.References, link)
 	}
-	return refs
+	if inner, ok := f.Options["fieldIdInLinkedTable"].(string); ok && inner != "" {
+		ref.References = append(ref.References, inner)
+	}
+	if f.Type == "formula" {
+		ref.ReferencesKnown = hasIDs
+	} else {
+		ref.ReferencesKnown = hasLink && link != ""
+	}
+	return ref
 }
 
 type Record struct {

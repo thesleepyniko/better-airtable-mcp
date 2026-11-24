@@ -155,11 +155,21 @@ func (p *Policy) Table(baseID, tableID, tableName string) TablePolicy {
 	return table
 }
 
-// Resolve applies the policy to a base's whole schema. Beyond the configured
-// rules, a computed field (formula, rollup, lookup, count) is hidden when it
-// reads a hidden field or a field of another schema-only table, since its
-// value would expose that data; otherwise it inherits the redaction of every
-// field it reads. Both follow chains of computed fields.
+// Resolve applies the policy to a base's whole schema, failing closed. Beyond
+// the configured rules it hides:
+//   - link fields into another table that is schema-only, since they expose
+//     its record IDs and feed lookups and counts;
+//   - computed fields whose inputs are unknown (Airtable sent no options);
+//   - computed fields that read a hidden field or a field of another
+//     schema-only table;
+//   - lookups, rollups, and counts over a link into a table with hidden
+//     fields, since their record conditions are not visible to the server
+//     and could filter on a hidden field.
+//
+// A computed field that reads a redacted text field is fully redacted, since
+// a formula can rewrite a value (SUBSTITUTE, MID) so no pattern finds it.
+// All of this follows chains of computed fields, in any order and across
+// tables.
 func (p *Policy) Resolve(baseID string, tables []TableRef) Resolved {
 	resolved := Resolved{
 		hidden:     map[string]bool{},
@@ -167,38 +177,66 @@ func (p *Policy) Resolve(baseID string, tables []TableRef) Resolved {
 		schemaOnly: map[string]bool{},
 	}
 	owner := map[string]string{}
+	byID := map[string]FieldRef{}
+	tableHasHidden := map[string]bool{}
 	var fields []FieldRef
+	active := p != nil
 	for _, table := range tables {
 		tablePolicy := p.Table(baseID, table.ID, table.Name)
 		resolved.schemaOnly[table.ID] = tablePolicy.SchemaOnly()
 		for _, field := range table.Fields {
 			owner[field.ID] = table.ID
+			byID[field.ID] = field
 			fields = append(fields, field)
 			if tablePolicy.Hidden(field.ID, field.Name) {
 				resolved.hidden[field.ID] = true
+				tableHasHidden[table.ID] = true
 			}
 			resolved.detectors[field.ID] = tablePolicy.Detectors(field.ID, field.Name)
 		}
 	}
+	if !active {
+		return resolved
+	}
 
+	hide := func(field FieldRef) {
+		resolved.hidden[field.ID] = true
+		tableHasHidden[owner[field.ID]] = true
+	}
 	for changed := true; changed; {
 		changed = false
 		for _, field := range fields {
 			if resolved.hidden[field.ID] {
 				continue
 			}
+			own := owner[field.ID]
+			if field.LinkedTableID != "" && field.LinkedTableID != own && resolved.schemaOnly[field.LinkedTableID] {
+				hide(field)
+				changed = true
+				continue
+			}
+			if !field.Computed {
+				continue
+			}
+			if !field.ReferencesKnown {
+				hide(field)
+				changed = true
+				continue
+			}
 			for _, ref := range field.References {
-				refTable, known := owner[ref]
+				refField, known := byID[ref]
 				if !known {
 					continue
 				}
-				if resolved.hidden[ref] || (resolved.schemaOnly[refTable] && refTable != owner[field.ID]) {
-					resolved.hidden[field.ID] = true
+				refTable := owner[ref]
+				if resolved.hidden[ref] || (resolved.schemaOnly[refTable] && refTable != own) ||
+					(refField.LinkedTableID != "" && tableHasHidden[refField.LinkedTableID]) {
+					hide(field)
 					changed = true
 					break
 				}
-				if merged := resolved.detectors[field.ID] | resolved.detectors[ref]; merged != resolved.detectors[field.ID] {
-					resolved.detectors[field.ID] = merged
+				if resolved.detectors[ref] != 0 && refField.carriesText() && resolved.detectors[field.ID]&DetectFull == 0 {
+					resolved.detectors[field.ID] |= DetectFull
 					changed = true
 				}
 			}
@@ -278,9 +316,28 @@ type TableRef struct {
 type FieldRef struct {
 	ID   string
 	Name string
-	// References lists the field IDs a computed field reads (from Airtable's
-	// field options); empty for ordinary fields.
-	References []string
+	// Type is the Airtable field type.
+	Type string
+	// LinkedTableID is the table a link field points to.
+	LinkedTableID string
+	// Computed marks formula, rollup, lookup, and count fields. References
+	// lists the field IDs one reads, from Airtable's field options, and
+	// ReferencesKnown is false when the options did not say.
+	Computed        bool
+	References      []string
+	ReferencesKnown bool
+}
+
+// opaqueTypes hold values no pattern redacts (numbers, dates, record IDs), so
+// a computed field reading one cannot leak redacted text through it.
+var opaqueTypes = map[string]bool{
+	"multipleRecordLinks": true, "number": true, "currency": true, "percent": true,
+	"autoNumber": true, "checkbox": true, "date": true, "dateTime": true,
+	"createdTime": true, "lastModifiedTime": true, "rating": true, "duration": true, "count": true,
+}
+
+func (f FieldRef) carriesText() bool {
+	return !opaqueTypes[f.Type]
 }
 
 // TablePolicy is the policy for one table.

@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"os"
@@ -103,6 +104,9 @@ func main() {
 			"error_kind", logx.ErrorKind(err),
 			"error_message", logx.ErrorPreview(err),
 		)
+		if errors.Is(err, syncer.ErrStalePolicyCache) {
+			os.Exit(1)
+		}
 	}
 	if err := syncManager.RestoreActiveWorkers(context.Background()); err != nil {
 		logx.Event(context.Background(), "server", "server.background_init_failed",

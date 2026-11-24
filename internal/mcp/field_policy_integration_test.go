@@ -244,8 +244,18 @@ func TestFieldPolicyGatesAndRedactsEveryToolOverMCP(t *testing.T) {
 		"type": "create_records", "table": "payroll",
 		"records": []map[string]any{{"fields": map[string]any{"payee": "Grace", "amount": 1}}},
 	}}})
-	if !strings.Contains(payrollCreate, "pending_approval") {
-		t.Fatalf("creating records in a schema-only table should still go to approval, got %s", payrollCreate)
+	if !strings.Contains(payrollCreate, "schema-only") {
+		t.Fatalf("creating records in a schema-only table should be refused, got %s", payrollCreate)
+	}
+
+	// Computed fields could read hidden data server-side, so the agent cannot create them.
+	for _, operation := range []map[string]any{
+		{"type": "create_field", "table": "Contacts", "name": "Leak", "field_type": "formula", "options": map[string]any{"formula": "{SSN}"}},
+		{"type": "create_table", "name": "Leaks", "fields": []map[string]any{{"name": "Name", "type": "singleLineText"}, {"name": "Copy", "type": "multipleLookupValues"}}},
+	} {
+		if result := schemaChange(operation); !strings.Contains(result, "computed fields") {
+			t.Fatalf("creating a computed field should be refused, got %s", result)
+		}
 	}
 
 	// Writes: hidden fields cannot be resolved by column, original name, or ID.

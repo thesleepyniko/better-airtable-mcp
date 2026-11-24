@@ -130,56 +130,71 @@ func TestUnmatchedKeysReportsTyposAndRenames(t *testing.T) {
 	}
 }
 
-func TestResolveHidesComputedFieldsThatReadHiddenOrSchemaOnlyData(t *testing.T) {
+func TestResolveFailsClosedOnComputedAndLinkedFields(t *testing.T) {
 	policy, err := Parse([]byte(`{"bases":{"appA":{"tables":{
-		"People":  {"hidden_fields": ["SSN"], "redact": {"Email": ["email"], "Bio": ["full"]}},
+		"People":  {"hidden_fields": ["SSN"], "redact": {"Email": ["email"]}},
 		"Payroll": {"schema_only": true}
 	}}}}`))
 	if err != nil {
 		t.Fatalf("Parse() returned error: %v", err)
 	}
+	formula := func(id string, refs ...string) FieldRef {
+		return FieldRef{ID: id, Name: id, Type: "formula", Computed: true, References: refs, ReferencesKnown: true}
+	}
 	resolved := policy.Resolve("appA", []TableRef{
 		{ID: "tblPeople", Name: "People", Fields: []FieldRef{
-			{ID: "fldSSN", Name: "SSN"},
-			{ID: "fldEmail", Name: "Email"},
-			{ID: "fldBio", Name: "Bio"},
-			{ID: "fldLast4", Name: "SSN last 4", References: []string{"fldSSN"}},
+			{ID: "fldSSN", Name: "SSN", Type: "singleLineText"},
+			{ID: "fldEmail", Name: "Email", Type: "email"},
+			{ID: "fldName", Name: "Name", Type: "singleLineText"},
+			{ID: "fldAge", Name: "Age", Type: "number"},
+			formula("fldLast4", "fldSSN"),
 			// Declared before the field it reads, so one pass is not enough.
-			{ID: "fldMasked", Name: "Masked", References: []string{"fldLast4b"}},
-			{ID: "fldLast4b", Name: "Last 4 again", References: []string{"fldLast4"}},
-			{ID: "fldContact", Name: "Contact", References: []string{"fldEmail", "fldBio"}},
-			{ID: "fldPayLink", Name: "Payroll", References: nil},
-			{ID: "fldSalary", Name: "Salary (lookup)", References: []string{"fldPayLink", "fldAmount"}},
-			{ID: "fldPayCount", Name: "Payslips", References: []string{"fldPayLink"}},
+			formula("fldMasked", "fldLast4b"),
+			formula("fldLast4b", "fldLast4"),
+			// SUBSTITUTE({Email}, "@", " at ") would defeat the email pattern.
+			formula("fldContact", "fldEmail"),
+			formula("fldNameAge", "fldName", "fldAge"),
+			{ID: "fldBroken", Name: "Broken", Type: "formula", Computed: true},
+			{ID: "fldPayLink", Name: "Payslips", Type: "multipleRecordLinks", LinkedTableID: "tblPayroll"},
+			{ID: "fldPayCount", Name: "Payslip count", Type: "count", Computed: true, References: []string{"fldPayLink"}, ReferencesKnown: true},
 		}},
 		{ID: "tblPayroll", Name: "Payroll", Fields: []FieldRef{
-			{ID: "fldAmount", Name: "Amount"},
-			{ID: "fldDouble", Name: "Double", References: []string{"fldAmount"}},
+			{ID: "fldAmount", Name: "Amount", Type: "currency"},
+			{ID: "fldPerson", Name: "Person", Type: "multipleRecordLinks", LinkedTableID: "tblPeople"},
 		}},
 		{ID: "tblOrders", Name: "Orders", Fields: []FieldRef{
-			{ID: "fldBuyerSSN", Name: "Buyer SSN", References: []string{"fldBuyer", "fldSSN"}},
-			{ID: "fldBuyerEmail", Name: "Buyer email", References: []string{"fldBuyer", "fldEmail"}},
+			{ID: "fldBuyer", Name: "Buyer", Type: "multipleRecordLinks", LinkedTableID: "tblPeople"},
+			// People has a hidden field, so a lookup through Buyer could
+			// filter on it with conditions the API does not describe.
+			{ID: "fldBuyerName", Name: "Buyer name", Type: "multipleLookupValues", Computed: true, References: []string{"fldBuyer", "fldName"}, ReferencesKnown: true},
+			{ID: "fldItem", Name: "Item", Type: "singleLineText"},
+			{ID: "fldShout", Name: "Shout", Type: "formula", Computed: true, References: []string{"fldItem"}, ReferencesKnown: true},
 		}},
 	})
 
-	for _, id := range []string{"fldSSN", "fldLast4", "fldLast4b", "fldMasked", "fldSalary", "fldBuyerSSN"} {
+	for _, id := range []string{"fldSSN", "fldLast4", "fldLast4b", "fldMasked", "fldBroken", "fldPayLink", "fldPayCount", "fldBuyerName"} {
 		if !resolved.Hidden(id) {
 			t.Errorf("%s should be hidden", id)
 		}
 	}
-	for _, id := range []string{"fldEmail", "fldContact", "fldPayLink", "fldPayCount", "fldAmount", "fldDouble", "fldBuyerEmail"} {
+	for _, id := range []string{"fldEmail", "fldName", "fldContact", "fldNameAge", "fldAmount", "fldPerson", "fldBuyer", "fldShout"} {
 		if resolved.Hidden(id) {
 			t.Errorf("%s should stay visible", id)
 		}
 	}
-	if got := resolved.Detectors("fldContact"); got != DetectEmail|DetectFull {
-		t.Errorf("Contact detectors = %b, want inherited email|full", got)
+	if resolved.Detectors("fldContact")&DetectFull == 0 {
+		t.Error("a formula over a redacted text field must be fully redacted")
 	}
-	if got := resolved.Detectors("fldBuyerEmail"); got != DetectEmail {
-		t.Errorf("a lookup of a redacted field in another table must inherit it, got %b", got)
+	if resolved.Detectors("fldNameAge") != 0 || resolved.Detectors("fldShout") != 0 {
+		t.Error("formulas over unredacted fields must not be redacted")
 	}
 	if !resolved.SchemaOnly("tblPayroll") || resolved.SchemaOnly("tblPeople") {
 		t.Error("only Payroll is schema-only")
+	}
+
+	var none *Policy
+	if none.Resolve("appA", []TableRef{{ID: "tbl", Fields: []FieldRef{{ID: "fldBroken", Computed: true}}}}).Hidden("fldBroken") {
+		t.Error("with no policy nothing is hidden")
 	}
 }
 
