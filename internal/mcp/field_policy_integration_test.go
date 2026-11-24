@@ -32,11 +32,12 @@ const fieldPolicyTestDoc = `{
   "bases": {"appPeople": {"tables": {"Contacts": {
     "hidden_fields": ["SSN", "fldSalary"],
     "redact": {"Notes": ["all"], "Bio": ["full"]}
-  }}}}
+  },
+  "Payroll": {"schema_only": true}}}}
 }`
 
 // Values that must never reach the agent through any tool.
-var fieldPolicySecrets = []string{"123-45-6789", "120000", "ada@example.com", "555-123-4567", "4111 1111 1111 1111", "Analytical Way", "SSN", "ssn", "Salary", "salary"}
+var fieldPolicySecrets = []string{"6789", "last_4", "123-45-6789", "120000", "ada@example.com", "555-123-4567", "4111 1111 1111 1111", "Analytical Way", "SSN", "ssn", "Salary", "salary"}
 
 func TestFieldPolicyGatesAndRedactsEveryToolOverMCP(t *testing.T) {
 	port := mutateFreePort(t)
@@ -72,6 +73,13 @@ func TestFieldPolicyGatesAndRedactsEveryToolOverMCP(t *testing.T) {
 			})
 		case r.URL.Path == "/v0/meta/bases/appPeople/tables" && r.Method == http.MethodGet:
 			writeMCPJSON(t, w, map[string]any{"tables": []map[string]any{{
+				"id":   "tblPayroll",
+				"name": "Payroll",
+				"fields": []map[string]any{
+					{"id": "fldPayee", "name": "Payee", "type": "singleLineText"},
+					{"id": "fldAmount", "name": "Amount", "type": "currency"},
+				},
+			}, {
 				"id":   "tblContacts",
 				"name": "Contacts",
 				"fields": []map[string]any{
@@ -81,19 +89,24 @@ func TestFieldPolicyGatesAndRedactsEveryToolOverMCP(t *testing.T) {
 					{"id": "fldSalary", "name": "Salary", "type": "currency"},
 					{"id": "fldNotes", "name": "Notes", "type": "multilineText"},
 					{"id": "fldBio", "name": "Bio", "type": "multilineText"},
+					{"id": "fldSSNLast4", "name": "SSN Last 4", "type": "formula", "options": map[string]any{"referencedFieldIds": []string{"fldSSN"}}},
 				},
 			}}})
+		case r.URL.Path == "/v0/appPeople/tblPayroll":
+			t.Errorf("schema-only Payroll records must never be fetched")
+			writeMCPJSON(t, w, map[string]any{"records": []map[string]any{}})
 		case r.URL.Path == "/v0/appPeople/tblContacts" && r.Method == http.MethodGet:
 			writeMCPJSON(t, w, map[string]any{"records": []map[string]any{{
 				"id":          "recAda",
 				"createdTime": "2026-04-01T12:00:00Z",
 				"fields": map[string]any{
-					"Name":   "Ada Lovelace",
-					"Email":  "ada@example.com",
-					"SSN":    "123-45-6789",
-					"Salary": 120000,
-					"Notes":  "Call 555-123-4567 or ada@example.com; card 4111 1111 1111 1111",
-					"Bio":    "Lives at 12 Analytical Way",
+					"Name":       "Ada Lovelace",
+					"Email":      "ada@example.com",
+					"SSN":        "123-45-6789",
+					"Salary":     120000,
+					"Notes":      "Call 555-123-4567 or ada@example.com; card 4111 1111 1111 1111",
+					"Bio":        "Lives at 12 Analytical Way",
+					"SSN Last 4": "6789",
 				},
 			}}})
 		default:
@@ -211,6 +224,28 @@ func TestFieldPolicyGatesAndRedactsEveryToolOverMCP(t *testing.T) {
 		if !strings.Contains(named, "not found") && !strings.Contains(named, "does not have a column") {
 			t.Fatalf("%s should fail with a missing-column error, got %s", sql, named)
 		}
+	}
+
+	// Schema-only: columns are listed and labelled, records are withheld.
+	if !strings.Contains(schemaText, `# payroll (schema only`) || !strings.Contains(schemaText, `id,created_time,payee,amount`) || !strings.Contains(schemaText, `"sync_status":"schema_only"`) {
+		t.Fatalf("list_schema should list payroll's columns and label it schema-only, got %s", schemaText)
+	}
+	if payroll := call("query", map[string]any{"base": "People", "sql": []string{"SELECT * FROM payroll"}}); !strings.Contains(payroll, `"row_count":0`) {
+		t.Fatalf("a schema-only table should return no rows, got %s", payroll)
+	}
+	payrollUpdate := call("mutate", map[string]any{"base": "People", "operations": []map[string]any{{
+		"type": "update_records", "table": "payroll",
+		"records": []map[string]any{{"id": "recPay1", "fields": map[string]any{"amount": 1}}},
+	}}})
+	if !strings.Contains(payrollUpdate, "schema-only") {
+		t.Fatalf("updating a schema-only table should be refused, got %s", payrollUpdate)
+	}
+	payrollCreate := call("mutate", map[string]any{"base": "People", "operations": []map[string]any{{
+		"type": "create_records", "table": "payroll",
+		"records": []map[string]any{{"fields": map[string]any{"payee": "Grace", "amount": 1}}},
+	}}})
+	if !strings.Contains(payrollCreate, "pending_approval") {
+		t.Fatalf("creating records in a schema-only table should still go to approval, got %s", payrollCreate)
 	}
 
 	// Writes: hidden fields cannot be resolved by column, original name, or ID.

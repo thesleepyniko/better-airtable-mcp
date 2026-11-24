@@ -120,10 +120,31 @@ type Table struct {
 }
 
 type Field struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Type        string `json:"type"`
-	Description string `json:"description,omitempty"`
+	ID          string         `json:"id"`
+	Name        string         `json:"name"`
+	Type        string         `json:"type"`
+	Description string         `json:"description,omitempty"`
+	Options     map[string]any `json:"options,omitempty"`
+}
+
+// referencedFieldIDs lists the fields a computed field reads, from its
+// Airtable options: formula and rollup inputs, and the link and linked-table
+// field behind a lookup, rollup, or count.
+func (f Field) referencedFieldIDs() []string {
+	var refs []string
+	for _, key := range []string{"recordLinkFieldId", "fieldIdInLinkedTable"} {
+		if id, ok := f.Options[key].(string); ok && id != "" {
+			refs = append(refs, id)
+		}
+	}
+	if ids, ok := f.Options["referencedFieldIds"].([]any); ok {
+		for _, raw := range ids {
+			if id, ok := raw.(string); ok && id != "" {
+				refs = append(refs, id)
+			}
+		}
+	}
+	return refs
 }
 
 type Record struct {

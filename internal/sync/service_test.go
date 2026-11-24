@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -247,5 +248,106 @@ func TestSyncKeepsHiddenFieldsAndRawPIIOutOfTheCache(t *testing.T) {
 	fingerprint, err := duckdb.ReadFieldPolicyFingerprint(ctx, service.DatabasePath("appPeople"))
 	if err != nil || fingerprint != policy.Fingerprint() {
 		t.Fatalf("cache fingerprint = %q (%v), want %q", fingerprint, err, policy.Fingerprint())
+	}
+}
+
+type derivedPolicyClient struct {
+	countingBasesClient
+	mu           sync.Mutex
+	fetchedPages map[string]int
+}
+
+func (c *derivedPolicyClient) GetBaseSchema(ctx context.Context, accessToken, baseID string) ([]Table, error) {
+	return []Table{
+		{ID: "tblPeople", Name: "People", Fields: []Field{
+			{ID: "fldName", Name: "Name", Type: "singleLineText"},
+			{ID: "fldSSN", Name: "SSN", Type: "singleLineText"},
+			{ID: "fldEmail", Name: "Email", Type: "email"},
+			{ID: "fldLast4", Name: "SSN Last 4", Type: "formula", Options: map[string]any{"referencedFieldIds": []any{"fldSSN"}}},
+			{ID: "fldGreeting", Name: "Greeting", Type: "formula", Options: map[string]any{"referencedFieldIds": []any{"fldName", "fldEmail"}}},
+			{ID: "fldPay", Name: "Payslips", Type: "multipleRecordLinks", Options: map[string]any{"linkedTableId": "tblPayroll"}},
+			{ID: "fldTotalPay", Name: "Total Pay", Type: "rollup", Options: map[string]any{"recordLinkFieldId": "fldPay", "fieldIdInLinkedTable": "fldAmount", "referencedFieldIds": []any{}}},
+		}},
+		{ID: "tblPayroll", Name: "Payroll", Fields: []Field{
+			{ID: "fldAmount", Name: "Amount", Type: "currency"},
+			{ID: "fldPerson", Name: "Person", Type: "multipleRecordLinks", Options: map[string]any{"linkedTableId": "tblPeople"}},
+		}},
+	}, nil
+}
+
+func (c *derivedPolicyClient) ListRecordsPage(ctx context.Context, accessToken, baseID, tableID string, options ListRecordsPageOptions) (ListRecordsPageResult, error) {
+	c.mu.Lock()
+	c.fetchedPages[tableID]++
+	c.mu.Unlock()
+	if tableID == "tblPayroll" {
+		return ListRecordsPageResult{Records: []Record{{ID: "recPay1", Fields: map[string]any{"Amount": 9000.0, "Person": []any{"recAda"}}}}}, nil
+	}
+	return ListRecordsPageResult{Records: []Record{{
+		ID:          "recAda",
+		CreatedTime: time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC),
+		Fields: map[string]any{
+			"Name":       "Ada",
+			"SSN":        "123-45-6789",
+			"Email":      "ada@example.com",
+			"SSN Last 4": "6789",
+			"Greeting":   "Hi Ada <ada@example.com>",
+			"Payslips":   []any{"recPay1"},
+			"Total Pay":  9000.0,
+		},
+	}}}, nil
+}
+
+func TestSyncHidesDerivedFieldsAndWithholdsSchemaOnlyTables(t *testing.T) {
+	policy, err := fieldpolicy.Parse([]byte(`{"bases": {"appPeople": {"tables": {
+		"People":  {"hidden_fields": ["SSN"], "redact": {"Email": ["email"]}},
+		"Payroll": {"schema_only": true}
+	}}}}`))
+	if err != nil {
+		t.Fatalf("Parse() returned error: %v", err)
+	}
+	client := &derivedPolicyClient{
+		countingBasesClient: countingBasesClient{bases: []Base{{ID: "appPeople", Name: "People"}}},
+		fetchedPages:        map[string]int{},
+	}
+	service := NewService(client, t.TempDir())
+	service.SetFieldPolicy(policy)
+	ctx := context.Background()
+	var last SyncProgress
+	if _, err := service.runSync(ctx, StaticAccessToken("token"), Base{ID: "appPeople", Name: "People"}, func(p SyncProgress) { last = p }); err != nil {
+		t.Fatalf("runSync() returned error: %v", err)
+	}
+	if last.Status != "completed" || last.TablesCompleted != 2 {
+		t.Fatalf("expected a completed run counting the schema-only table, got %+v", last)
+	}
+	if client.fetchedPages["tblPayroll"] != 0 {
+		t.Fatalf("schema-only Payroll records were fetched %d times", client.fetchedPages["tblPayroll"])
+	}
+
+	people, err := service.QueryResolvedBase(ctx, "appPeople", "SELECT * FROM people")
+	if err != nil {
+		t.Fatalf("SELECT * FROM people returned error: %v", err)
+	}
+	if want := []string{"id", "created_time", "name", "email", "greeting", "payslips"}; !reflect.DeepEqual(people.Columns, want) {
+		t.Fatalf("people columns = %v, want %v (formula over SSN and rollup over Payroll hidden)", people.Columns, want)
+	}
+	if greeting := people.Rows[0][4]; greeting != "Hi Ada <[REDACTED_EMAIL]>" {
+		t.Fatalf("greeting = %#v, want the formula to inherit Email's redaction", greeting)
+	}
+
+	payroll, err := service.QueryResolvedBase(ctx, "appPeople", "SELECT * FROM payroll")
+	if err != nil {
+		t.Fatalf("SELECT * FROM payroll returned error: %v", err)
+	}
+	if want := []string{"id", "created_time", "amount", "person"}; !reflect.DeepEqual(payroll.Columns, want) || len(payroll.Rows) != 0 {
+		t.Fatalf("payroll = %v with %d rows, want its columns and no rows", payroll.Columns, len(payroll.Rows))
+	}
+	schema, err := service.ListResolvedSchema(ctx, "appPeople", "People")
+	if err != nil {
+		t.Fatalf("ListResolvedSchema() returned error: %v", err)
+	}
+	for _, table := range schema.Tables {
+		if table.DuckDBTableName == "payroll" && table.SyncStatus != duckdb.TableSyncSchemaOnly {
+			t.Fatalf("payroll sync status = %q, want %q", table.SyncStatus, duckdb.TableSyncSchemaOnly)
+		}
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/hackclub/better-airtable-mcp/internal/duckdb"
 	"github.com/hackclub/better-airtable-mcp/internal/mcp"
 )
 
@@ -128,7 +129,11 @@ func formatSchemaCSV(baseID, baseName string, tables []map[string]any, syncStatu
 		tableName := fmt.Sprint(table["duckdb_table_name"])
 		headers := schemaTableHeaders(table)
 		rows := schemaSampleRows(table, headers)
-		sections = append(sections, "# "+tableName, csvSection(headers, rows))
+		heading := "# " + tableName
+		if table["sync_status"] == duckdb.TableSyncSchemaOnly {
+			heading += " (schema only: this server withholds its records, so queries return no rows)"
+		}
+		sections = append(sections, heading, csvSection(headers, rows))
 	}
 
 	return joinSections(sections...)

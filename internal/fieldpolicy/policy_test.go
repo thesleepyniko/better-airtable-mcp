@@ -129,3 +129,70 @@ func TestUnmatchedKeysReportsTyposAndRenames(t *testing.T) {
 		t.Fatalf("UnmatchedKeys() = %v, want %v", got, want)
 	}
 }
+
+func TestResolveHidesComputedFieldsThatReadHiddenOrSchemaOnlyData(t *testing.T) {
+	policy, err := Parse([]byte(`{"bases":{"appA":{"tables":{
+		"People":  {"hidden_fields": ["SSN"], "redact": {"Email": ["email"], "Bio": ["full"]}},
+		"Payroll": {"schema_only": true}
+	}}}}`))
+	if err != nil {
+		t.Fatalf("Parse() returned error: %v", err)
+	}
+	resolved := policy.Resolve("appA", []TableRef{
+		{ID: "tblPeople", Name: "People", Fields: []FieldRef{
+			{ID: "fldSSN", Name: "SSN"},
+			{ID: "fldEmail", Name: "Email"},
+			{ID: "fldBio", Name: "Bio"},
+			{ID: "fldLast4", Name: "SSN last 4", References: []string{"fldSSN"}},
+			// Declared before the field it reads, so one pass is not enough.
+			{ID: "fldMasked", Name: "Masked", References: []string{"fldLast4b"}},
+			{ID: "fldLast4b", Name: "Last 4 again", References: []string{"fldLast4"}},
+			{ID: "fldContact", Name: "Contact", References: []string{"fldEmail", "fldBio"}},
+			{ID: "fldPayLink", Name: "Payroll", References: nil},
+			{ID: "fldSalary", Name: "Salary (lookup)", References: []string{"fldPayLink", "fldAmount"}},
+			{ID: "fldPayCount", Name: "Payslips", References: []string{"fldPayLink"}},
+		}},
+		{ID: "tblPayroll", Name: "Payroll", Fields: []FieldRef{
+			{ID: "fldAmount", Name: "Amount"},
+			{ID: "fldDouble", Name: "Double", References: []string{"fldAmount"}},
+		}},
+		{ID: "tblOrders", Name: "Orders", Fields: []FieldRef{
+			{ID: "fldBuyerSSN", Name: "Buyer SSN", References: []string{"fldBuyer", "fldSSN"}},
+			{ID: "fldBuyerEmail", Name: "Buyer email", References: []string{"fldBuyer", "fldEmail"}},
+		}},
+	})
+
+	for _, id := range []string{"fldSSN", "fldLast4", "fldLast4b", "fldMasked", "fldSalary", "fldBuyerSSN"} {
+		if !resolved.Hidden(id) {
+			t.Errorf("%s should be hidden", id)
+		}
+	}
+	for _, id := range []string{"fldEmail", "fldContact", "fldPayLink", "fldPayCount", "fldAmount", "fldDouble", "fldBuyerEmail"} {
+		if resolved.Hidden(id) {
+			t.Errorf("%s should stay visible", id)
+		}
+	}
+	if got := resolved.Detectors("fldContact"); got != DetectEmail|DetectFull {
+		t.Errorf("Contact detectors = %b, want inherited email|full", got)
+	}
+	if got := resolved.Detectors("fldBuyerEmail"); got != DetectEmail {
+		t.Errorf("a lookup of a redacted field in another table must inherit it, got %b", got)
+	}
+	if !resolved.SchemaOnly("tblPayroll") || resolved.SchemaOnly("tblPeople") {
+		t.Error("only Payroll is schema-only")
+	}
+}
+
+func TestBaseLevelSchemaOnly(t *testing.T) {
+	policy, err := Parse([]byte(`{"bases":{"appA":{"schema_only":true}}}`))
+	if err != nil || policy == nil {
+		t.Fatalf("a base-level schema_only policy must not be empty: %v", err)
+	}
+	table := policy.Table("appA", "tblAny", "Any")
+	if !table.SchemaOnly() || table.Configured() {
+		t.Fatal("every table of the base is schema-only, without counting as a name-keyed table rule")
+	}
+	if policy.Table("appB", "tblAny", "Any").SchemaOnly() {
+		t.Fatal("schema_only must not leak to other bases")
+	}
+}

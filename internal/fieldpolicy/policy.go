@@ -18,15 +18,17 @@ import (
 // Policy is the parsed FIELD_POLICY. The nil *Policy is the empty policy:
 // nothing hidden, nothing redacted.
 type Policy struct {
-	global      Detectors
-	bases       map[string][]tableEntry
-	fingerprint string
+	global         Detectors
+	bases          map[string][]tableEntry
+	schemaOnlyBase map[string]bool
+	fingerprint    string
 }
 
 type tableEntry struct {
-	key    string
-	hidden []string
-	redact map[string]Detectors
+	key        string
+	schemaOnly bool
+	hidden     []string
+	redact     map[string]Detectors
 }
 
 type rawPolicy struct {
@@ -35,10 +37,12 @@ type rawPolicy struct {
 }
 
 type rawBase struct {
-	Tables map[string]rawTable `json:"tables"`
+	SchemaOnly bool                `json:"schema_only,omitempty"`
+	Tables     map[string]rawTable `json:"tables,omitempty"`
 }
 
 type rawTable struct {
+	SchemaOnly   bool                `json:"schema_only,omitempty"`
 	HiddenFields []string            `json:"hidden_fields,omitempty"`
 	Redact       map[string][]string `json:"redact,omitempty"`
 }
@@ -71,7 +75,7 @@ func Parse(data []byte) (*Policy, error) {
 		return nil, fmt.Errorf("parse field policy: %w", err)
 	}
 
-	policy := &Policy{bases: make(map[string][]tableEntry)}
+	policy := &Policy{bases: make(map[string][]tableEntry), schemaOnlyBase: make(map[string]bool)}
 	global, err := parseDetectors(raw.Redact, "redact")
 	if err != nil {
 		return nil, err
@@ -82,12 +86,15 @@ func Parse(data []byte) (*Policy, error) {
 		if !strings.HasPrefix(baseID, "app") {
 			return nil, fmt.Errorf("field policy: bases key %q must be an Airtable base ID (app...)", baseID)
 		}
+		if base.SchemaOnly {
+			policy.schemaOnlyBase[baseID] = true
+		}
 		for tableKey, table := range base.Tables {
 			tableKey = strings.TrimSpace(tableKey)
 			if tableKey == "" {
 				return nil, fmt.Errorf("field policy: base %s has an empty table key", baseID)
 			}
-			entry := tableEntry{key: tableKey, redact: make(map[string]Detectors)}
+			entry := tableEntry{key: tableKey, schemaOnly: table.SchemaOnly, redact: make(map[string]Detectors)}
 			for _, field := range table.HiddenFields {
 				if field = strings.TrimSpace(field); field == "" || field == "*" {
 					return nil, fmt.Errorf("field policy: %s/%s hidden_fields entries must name a field", baseID, tableKey)
@@ -109,7 +116,7 @@ func Parse(data []byte) (*Policy, error) {
 		}
 	}
 
-	if policy.global == 0 && len(policy.bases) == 0 {
+	if policy.global == 0 && len(policy.bases) == 0 && len(policy.schemaOnlyBase) == 0 {
 		return nil, nil
 	}
 
@@ -138,14 +145,84 @@ func (p *Policy) Table(baseID, tableID, tableName string) TablePolicy {
 	if p == nil {
 		return TablePolicy{}
 	}
-	table := TablePolicy{global: p.global}
+	table := TablePolicy{global: p.global, schemaOnly: p.schemaOnlyBase[baseID]}
 	for _, entry := range p.bases[baseID] {
 		if matchesKey(entry.key, tableID, tableName) {
 			table.entries = append(table.entries, entry)
+			table.schemaOnly = table.schemaOnly || entry.schemaOnly
 		}
 	}
 	return table
 }
+
+// Resolve applies the policy to a base's whole schema. Beyond the configured
+// rules, a computed field (formula, rollup, lookup, count) is hidden when it
+// reads a hidden field or a field of another schema-only table, since its
+// value would expose that data; otherwise it inherits the redaction of every
+// field it reads. Both follow chains of computed fields.
+func (p *Policy) Resolve(baseID string, tables []TableRef) Resolved {
+	resolved := Resolved{
+		hidden:     map[string]bool{},
+		detectors:  map[string]Detectors{},
+		schemaOnly: map[string]bool{},
+	}
+	owner := map[string]string{}
+	var fields []FieldRef
+	for _, table := range tables {
+		tablePolicy := p.Table(baseID, table.ID, table.Name)
+		resolved.schemaOnly[table.ID] = tablePolicy.SchemaOnly()
+		for _, field := range table.Fields {
+			owner[field.ID] = table.ID
+			fields = append(fields, field)
+			if tablePolicy.Hidden(field.ID, field.Name) {
+				resolved.hidden[field.ID] = true
+			}
+			resolved.detectors[field.ID] = tablePolicy.Detectors(field.ID, field.Name)
+		}
+	}
+
+	for changed := true; changed; {
+		changed = false
+		for _, field := range fields {
+			if resolved.hidden[field.ID] {
+				continue
+			}
+			for _, ref := range field.References {
+				refTable, known := owner[ref]
+				if !known {
+					continue
+				}
+				if resolved.hidden[ref] || (resolved.schemaOnly[refTable] && refTable != owner[field.ID]) {
+					resolved.hidden[field.ID] = true
+					changed = true
+					break
+				}
+				if merged := resolved.detectors[field.ID] | resolved.detectors[ref]; merged != resolved.detectors[field.ID] {
+					resolved.detectors[field.ID] = merged
+					changed = true
+				}
+			}
+		}
+	}
+	return resolved
+}
+
+// Resolved is the policy applied to one base's schema, keyed by Airtable ID.
+type Resolved struct {
+	hidden     map[string]bool
+	detectors  map[string]Detectors
+	schemaOnly map[string]bool
+}
+
+// Hidden reports whether a field is hidden, by the policy or because it
+// derives from hidden or schema-only data.
+func (r Resolved) Hidden(fieldID string) bool { return r.hidden[fieldID] }
+
+// Detectors returns a field's redaction, including what it inherits.
+func (r Resolved) Detectors(fieldID string) Detectors { return r.detectors[fieldID] }
+
+// SchemaOnly reports whether a table's records are withheld entirely.
+func (r Resolved) SchemaOnly(tableID string) bool { return r.schemaOnly[tableID] }
 
 // UnmatchedKeys lists policy keys for baseID that match no table or field in
 // the given schema, as "table" or "table/field", so a typo or a rename in
@@ -201,17 +278,27 @@ type TableRef struct {
 type FieldRef struct {
 	ID   string
 	Name string
+	// References lists the field IDs a computed field reads (from Airtable's
+	// field options); empty for ordinary fields.
+	References []string
 }
 
 // TablePolicy is the policy for one table.
 type TablePolicy struct {
-	global  Detectors
-	entries []tableEntry
+	global     Detectors
+	entries    []tableEntry
+	schemaOnly bool
 }
 
 // Configured reports whether the policy names this table at all.
 func (t TablePolicy) Configured() bool {
 	return len(t.entries) > 0
+}
+
+// SchemaOnly reports whether the agent may see this table's schema but none
+// of its records.
+func (t TablePolicy) SchemaOnly() bool {
+	return t.schemaOnly
 }
 
 // Hidden reports whether a field must be excluded from the cache entirely.

@@ -253,6 +253,7 @@ recTask2,2026-04-01T13:15:00Z,QA revised layout
 - `content[0].text` is organized as `sync_status`, `base`, `tables`, then one `# {duckdb_table_name}` CSV section per table using the queryable column names as headers (`id`, `created_time`, and sanitized Airtable field names)
 - The agent should call this before writing queries or mutations to understand the schema
 - Fields hidden by the field policy (§4.7) are absent from `tables[].fields`, the sample rows, and the text output; sample values are already PII-redacted
+- A schema-only table (§4.7) lists its fields with no sample rows and `sync_status: "schema_only"`; its text section heading reads `# {duckdb_table_name} (schema only: this server withholds its records, so queries return no rows)`
 
 ---
 
@@ -472,6 +473,7 @@ For `delete_records`, `records` may be either objects containing `id` or plain A
 - After approval, executes against the Airtable API using the requesting user's Airtable token, never a shared sync token
 - After execution, partial completion, or failure, triggers an immediate base sync
 - Fields hidden by the field policy (§4.7) do not resolve by column name, original name, or Airtable field ID; the request fails as an unknown field and the suggestions list only visible fields
+- On a schema-only table (§4.7), `update_records` and `delete_records` are refused, since its records cannot be read for the preview; `create_records` goes through approval as usual
 - Rejects any field value containing a redaction placeholder (`[REDACTED]`, `[REDACTED_EMAIL]`, …): the cache only holds redacted copies, so writing one back would overwrite the real Airtable data
 
 ---
@@ -806,6 +808,7 @@ The server operator can keep specific fields away from agents entirely and redac
   "bases": {
     "appXXXXXXXXXXXXXX": {
       "tables": {
+        "Payroll": { "schema_only": true },
         "Contacts": {
           "hidden_fields": ["SSN", "fldXXXXXXXXXXXXXX"],
           "redact": {
@@ -822,6 +825,8 @@ The server operator can keep specific fields away from agents entirely and redac
 
 - **Keys**: bases are keyed by base ID. Tables and fields match by Airtable ID or, case-insensitively, by name; every matching table entry applies. IDs survive renames in Airtable, so prefer them.
 - **`hidden_fields`** (field gating): the sync drops these fields from the schema before DuckDB columns are named, and drops their values from every fetched record before anything is written. They get no column, no `_metadata` row, and leave no gap in neighbouring column names, so `list_schema`, `query` (including `SELECT *`), `mutate`, `manage_schema`, and the approval preview never see them.
+- **`schema_only`** (on a base, for all its tables, or on one table): the agent sees the table's fields but none of its records. The sync creates the empty table and never fetches its records; `_table_sync.sync_status` is `schema_only`, queries on it return no rows, and `list_schema` labels it.
+- **Computed fields follow their inputs**: Airtable's field `options` list what a formula (`referencedFieldIds`), rollup, lookup, or count (`recordLinkFieldId`, `fieldIdInLinkedTable`) reads. A computed field that reads a hidden field, or a field of another table that is schema-only, is hidden too; one that reads redacted fields inherits their detectors. Both follow chains of computed fields across tables.
 - **`redact`** (PII redaction): detectors apply to every value written to the cache. Effective detectors for a field are the union of the top-level `redact` list (every field of every base), the table's `"*"` rule, and the field's own rule.
 
 | Detector | Replaces with | Matches |
@@ -843,7 +848,8 @@ The server operator can keep specific fields away from agents entirely and redac
 - The policy is per deployment, matching the shared per-base cache (§4.6): it applies to every user of the base.
 
 **Limits:**
-- Formula, lookup, and rollup fields that read a hidden field can still expose its value; hide or redact them too.
+- Link fields into a schema-only table, and counts over them, stay visible: they expose record IDs and counts, not field values.
+- A computed field that only partially copies a redacted value (`LEFT({Email}, 3)`) inherits the detectors, but a pattern cannot recognise the fragment; use `full` on the source field when that matters.
 - Pattern detection is best-effort and cannot find names or postal addresses; use `full` for those fields.
 - Deleting a record removes its hidden fields' values along with it.
 
@@ -1263,7 +1269,7 @@ All configuration via environment variables:
 | **Staging refreshes after the first complete snapshot** | Keeps existing readers on a full snapshot while a refresh is in flight |
 | **Records-only mutations in V1** | Keeps the approval flow and executor focused on the core use case |
 | **Encrypt sensitive state at rest** | Protects third-party tokens and pending mutation payloads stored in Postgres |
-| **Field policy enforced at sync time** | Hidden fields and raw PII never enter the cache, so no tool or SQL expression can reach them; output-time filtering would be bypassable through SQL |
+| **Field policy enforced at sync time** | Hidden fields, schema-only records, and raw PII never enter the cache, so no tool or SQL expression can reach them; output-time filtering would be bypassable through SQL |
 
 ---
 

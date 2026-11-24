@@ -34,7 +34,13 @@ type TableSnapshot struct {
 	DuckDBTableName string
 	Fields          []FieldSnapshot
 	Records         []RecordSnapshot
+	// SchemaOnly marks a table whose records are withheld by the field
+	// policy: it is created empty and recorded as TableSyncSchemaOnly.
+	SchemaOnly bool
 }
+
+// TableSyncSchemaOnly is the _table_sync status of a schema-only table.
+const TableSyncSchemaOnly = "schema_only"
 
 type FieldSnapshot struct {
 	AirtableFieldID   string
@@ -323,12 +329,17 @@ func initializeSnapshot(ctx context.Context, db *sql.DB, init SnapshotInit) erro
 		if err := insertMetadataRows(ctx, tx, table); err != nil {
 			return err
 		}
-		if err := upsertTableSyncState(ctx, tx, TableSyncState{
+		state := TableSyncState{
 			TableName:          table.DuckDBTableName,
 			SyncStatus:         "pending",
 			VisibleRecordCount: 0,
 			HasMore:            true,
-		}); err != nil {
+		}
+		if table.SchemaOnly {
+			state.SyncStatus = TableSyncSchemaOnly
+			state.HasMore = false
+		}
+		if err := upsertTableSyncState(ctx, tx, state); err != nil {
 			return err
 		}
 	}

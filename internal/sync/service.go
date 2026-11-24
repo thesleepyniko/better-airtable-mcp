@@ -500,6 +500,7 @@ func (s *Service) runSync(ctx context.Context, tokens AccessTokenFunc, base Base
 			OriginalName:    plan.Table.OriginalName,
 			DuckDBTableName: plan.Table.DuckDBTableName,
 			Fields:          append([]duckdb.FieldSnapshot(nil), plan.Table.Fields...),
+			SchemaOnly:      plan.Table.SchemaOnly,
 		})
 	}
 
@@ -535,13 +536,23 @@ func (s *Service) runSync(ctx context.Context, tokens AccessTokenFunc, base Base
 		}
 	}
 
+	// Schema-only tables have their columns but no records, so they are done
+	// before the run starts and are never fetched.
+	schemaOnlyTables := 0
+	for _, plan := range plans {
+		if plan.Table.SchemaOnly {
+			schemaOnlyTables++
+		}
+	}
 	currentInfo := SyncProgress{
-		BaseID:        base.ID,
-		BaseName:      base.Name,
-		SyncStartedAt: startedAt,
-		Status:        "syncing",
-		TablesTotal:   len(plans),
-		ReadSnapshot:  "partial",
+		BaseID:          base.ID,
+		BaseName:        base.Name,
+		SyncStartedAt:   startedAt,
+		Status:          "syncing",
+		TablesTotal:     len(plans),
+		TablesStarted:   schemaOnlyTables,
+		TablesCompleted: schemaOnlyTables,
+		ReadSnapshot:    "partial",
 	}
 	if useStaging {
 		currentInfo.ReadSnapshot = "complete"
@@ -555,18 +566,20 @@ func (s *Service) runSync(ctx context.Context, tokens AccessTokenFunc, base Base
 		runtimes[index] = syncTableRuntime{Plan: plan}
 	}
 
-	if len(plans) > 0 {
+	if len(plans) > schemaOnlyTables {
 		workerCtx, cancel := context.WithCancel(ctx)
 		defer cancel()
 
 		jobs := make(chan syncJob, len(plans))
 		results := make(chan syncPageResult, len(plans))
 
-		for index := range plans {
-			jobs <- syncJob{TableIndex: index}
+		for index, plan := range plans {
+			if !plan.Table.SchemaOnly {
+				jobs <- syncJob{TableIndex: index}
+			}
 		}
 
-		workerCount := minInt(len(plans), maxParallelRecordRequests)
+		workerCount := minInt(len(plans)-schemaOnlyTables, maxParallelRecordRequests)
 		var workerWG sync.WaitGroup
 		for workerIndex := 0; workerIndex < workerCount; workerIndex++ {
 			workerWG.Add(1)
@@ -612,7 +625,7 @@ func (s *Service) runSync(ctx context.Context, tokens AccessTokenFunc, base Base
 			}()
 		}
 
-		pendingTables := len(plans)
+		pendingTables := len(plans) - schemaOnlyTables
 		var totalVisibleRecords int64
 		var activeBatch []duckdb.TablePage
 		var activeBatchRecords int
@@ -816,7 +829,7 @@ func policyTableRefs(tables []Table) []fieldpolicy.TableRef {
 	for _, table := range tables {
 		ref := fieldpolicy.TableRef{ID: table.ID, Name: table.Name}
 		for _, field := range table.Fields {
-			ref.Fields = append(ref.Fields, fieldpolicy.FieldRef{ID: field.ID, Name: field.Name})
+			ref.Fields = append(ref.Fields, fieldpolicy.FieldRef{ID: field.ID, Name: field.Name, References: field.referencedFieldIDs()})
 		}
 		refs = append(refs, ref)
 	}
@@ -824,9 +837,11 @@ func policyTableRefs(tables []Table) []fieldpolicy.TableRef {
 }
 
 // buildSyncPlans maps the Airtable schema to DuckDB tables. Fields the policy
-// hides are dropped here, before column names are assigned, so they get no
-// column, no _metadata row, and no trace in the names of their neighbours.
+// hides (directly, or because they compute from hidden or schema-only data)
+// are dropped here, before column names are assigned, so they get no column,
+// no _metadata row, and no trace in the names of their neighbours.
 func buildSyncPlans(baseID string, tables []Table, policy *fieldpolicy.Policy) ([]syncTablePlan, error) {
+	resolved := policy.Resolve(baseID, policyTableRefs(tables))
 	tableNames := make([]string, 0, len(tables))
 	for _, table := range tables {
 		tableNames = append(tableNames, table.Name)
@@ -835,10 +850,9 @@ func buildSyncPlans(baseID string, tables []Table, policy *fieldpolicy.Policy) (
 
 	plans := make([]syncTablePlan, 0, len(tables))
 	for tableIndex, table := range tables {
-		tablePolicy := policy.Table(baseID, table.ID, table.Name)
 		visibleFields := make([]Field, 0, len(table.Fields))
 		for _, field := range table.Fields {
-			if !tablePolicy.Hidden(field.ID, field.Name) {
+			if !resolved.Hidden(field.ID) {
 				visibleFields = append(visibleFields, field)
 			}
 		}
@@ -873,7 +887,7 @@ func buildSyncPlans(baseID string, tables []Table, policy *fieldpolicy.Policy) (
 				DuckDBType:        mapping.DuckDBType,
 			})
 			sanitizedIndex++
-			if detectors := tablePolicy.Detectors(field.ID, field.Name); detectors != 0 {
+			if detectors := resolved.Detectors(field.ID); detectors != 0 {
 				redact[field.Name] = detectors
 			}
 		}
@@ -884,6 +898,7 @@ func buildSyncPlans(baseID string, tables []Table, policy *fieldpolicy.Policy) (
 				OriginalName:    table.Name,
 				DuckDBTableName: sanitizedTableNames[tableIndex].Sanitized,
 				Fields:          fields,
+				SchemaOnly:      resolved.SchemaOnly(table.ID),
 			},
 			Sort: ListRecordsPageOptions{
 				SortFieldName: sortFieldName,
