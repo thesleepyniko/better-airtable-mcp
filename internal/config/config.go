@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/hackclub/better-airtable-mcp/internal/fieldpolicy"
 )
 
 const (
@@ -36,6 +38,7 @@ type Config struct {
 	QueryDefaultLimit    int
 	QueryMaxLimit        int
 	SyncMaxConcurrent    int
+	FieldPolicy          *fieldpolicy.Policy
 }
 
 func LoadFromEnv() (Config, error) {
@@ -91,6 +94,15 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	cfg.QueryDefaultLimit = intWithDefault(lookup, "QUERY_DEFAULT_LIMIT", cfg.QueryDefaultLimit, &problems)
 	cfg.QueryMaxLimit = intWithDefault(lookup, "QUERY_MAX_LIMIT", cfg.QueryMaxLimit, &problems)
 	cfg.SyncMaxConcurrent = intWithDefault(lookup, "SYNC_MAX_CONCURRENT", cfg.SyncMaxConcurrent, &problems)
+
+	if value, ok := lookup("FIELD_POLICY"); ok {
+		policy, err := fieldpolicy.Load(value)
+		if err != nil {
+			problems = append(problems, "FIELD_POLICY is invalid: "+err.Error())
+		} else {
+			cfg.FieldPolicy = policy
+		}
+	}
 
 	if cfg.QueryDefaultLimit <= 0 {
 		problems = append(problems, "QUERY_DEFAULT_LIMIT must be greater than zero")

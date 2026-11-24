@@ -230,6 +230,10 @@ func (s *Service) PrepareSchemaMutation(ctx context.Context, userID string, requ
 			if !ok {
 				return fail(fmt.Errorf("operations[%d]: unknown table %q; available tables: %s", i, op.Table, strings.Join(suggestions(op.Table, names), ", ")))
 			}
+			newName := strings.TrimSpace(op.Name)
+			if newName != "" && newName != table.OriginalName && s.syncer.FieldPolicy().Table(base.ID, table.AirtableTableID, table.OriginalName).Configured() {
+				return fail(fmt.Errorf("operations[%d]: table %q is covered by this server's field policy and cannot be renamed through manage_schema; rename it in Airtable and have the server operator update FIELD_POLICY", i, table.OriginalName))
+			}
 			payload.Operations = append(payload.Operations, schemaPayloadOp{
 				Type:        schemaUpdateTable,
 				TableID:     table.AirtableTableID,
@@ -246,6 +250,10 @@ func (s *Service) PrepareSchemaMutation(ctx context.Context, userID string, requ
 			field, ok := resolveFieldSchema(table.Fields, op.Field)
 			if !ok {
 				return fail(fmt.Errorf("operations[%d]: unknown field %q on table %q; available fields: %s", i, op.Field, table.OriginalName, strings.Join(suggestions(op.Field, collectFieldAliases(table.Fields)), ", ")))
+			}
+			newName := strings.TrimSpace(op.Name)
+			if newName != "" && newName != field.OriginalName && s.syncer.FieldPolicy().Table(base.ID, table.AirtableTableID, table.OriginalName).HasFieldRule(field.AirtableFieldID, field.OriginalName) {
+				return fail(fmt.Errorf("operations[%d]: field %q is covered by this server's field policy and cannot be renamed through manage_schema; rename it in Airtable and have the server operator update FIELD_POLICY", i, field.OriginalName))
 			}
 			payload.Operations = append(payload.Operations, schemaPayloadOp{
 				Type:        schemaUpdateField,

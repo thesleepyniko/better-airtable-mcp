@@ -2,9 +2,15 @@ package syncer
 
 import (
 	"context"
+	"fmt"
+	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/hackclub/better-airtable-mcp/internal/duckdb"
+	"github.com/hackclub/better-airtable-mcp/internal/fieldpolicy"
 )
 
 func TestBuildSyncPlansDisambiguatesDuplicateFieldNames(t *testing.T) {
@@ -17,7 +23,7 @@ func TestBuildSyncPlansDisambiguatesDuplicateFieldNames(t *testing.T) {
 		},
 	}}
 
-	plans, err := buildSyncPlans(tables)
+	plans, err := buildSyncPlans("appTest", tables, nil)
 	if err != nil {
 		t.Fatalf("buildSyncPlans() returned error: %v", err)
 	}
@@ -58,7 +64,7 @@ func TestBuildSyncPlansKeepsSanitizedIndexAlignedAcrossOmittedFields(t *testing.
 		},
 	}}
 
-	plans, err := buildSyncPlans(tables)
+	plans, err := buildSyncPlans("appTest", tables, nil)
 	if err != nil {
 		t.Fatalf("buildSyncPlans() returned error: %v", err)
 	}
@@ -139,5 +145,107 @@ func TestResolveBaseCachesBaseListPerToken(t *testing.T) {
 	}
 	if got := client.listBasesCalls.Load(); got != 3 {
 		t.Fatalf("expected a refreshed ListBases call after the TTL, got %d", got)
+	}
+}
+
+type policyTestClient struct {
+	countingBasesClient
+}
+
+func (c *policyTestClient) GetBaseSchema(ctx context.Context, accessToken, baseID string) ([]Table, error) {
+	return []Table{{
+		ID:   "tblContacts",
+		Name: "Contacts",
+		Fields: []Field{
+			{ID: "fldName", Name: "Name", Type: "singleLineText"},
+			// Sanitizes to "name" too; with the visible Name it would have
+			// been "name_2", so hiding it must not leave a gap in the names.
+			{ID: "fldName2", Name: "NAME", Type: "singleLineText"},
+			{ID: "fldSSN", Name: "SSN", Type: "singleLineText"},
+			{ID: "fldSalary", Name: "Salary", Type: "currency"},
+			{ID: "fldNotes", Name: "Notes", Type: "multilineText"},
+			{ID: "fldScore", Name: "Score", Type: "number"},
+			{ID: "fldTags", Name: "Tags", Type: "lookup"},
+		},
+	}}, nil
+}
+
+func (c *policyTestClient) ListRecordsPage(ctx context.Context, accessToken, baseID, tableID string, options ListRecordsPageOptions) (ListRecordsPageResult, error) {
+	return ListRecordsPageResult{Records: []Record{{
+		ID:          "recAda",
+		CreatedTime: time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC),
+		Fields: map[string]any{
+			"Name":   "Ada",
+			"NAME":   "secret alias",
+			"SSN":    "123-45-6789",
+			"Salary": 120000.0,
+			"Notes":  "call 555-123-4567 or ada@example.com",
+			"Score":  5551234567.0,
+			"Tags":   []any{"ops@example.com", "vip"},
+		},
+	}}}, nil
+}
+
+func TestSyncKeepsHiddenFieldsAndRawPIIOutOfTheCache(t *testing.T) {
+	policy, err := fieldpolicy.Parse([]byte(`{
+		"redact": ["email"],
+		"bases": {"appPeople": {"tables": {"Contacts": {
+			"hidden_fields": ["SSN", "fldSalary", "fldName2"],
+			"redact": {"Notes": ["phone"], "Score": ["phone"]}
+		}}}}
+	}`))
+	if err != nil {
+		t.Fatalf("Parse() returned error: %v", err)
+	}
+	client := &policyTestClient{countingBasesClient{bases: []Base{{ID: "appPeople", Name: "People"}}}}
+	service := NewService(client, t.TempDir())
+	service.SetFieldPolicy(policy)
+	ctx := context.Background()
+	if _, err := service.SyncBase(ctx, "token", "appPeople"); err != nil {
+		t.Fatalf("SyncBase() returned error: %v", err)
+	}
+
+	result, err := service.QueryResolvedBase(ctx, "appPeople", "SELECT * FROM contacts")
+	if err != nil {
+		t.Fatalf("SELECT * returned error: %v", err)
+	}
+	wantColumns := []string{"id", "created_time", "name", "notes", "score", "tags"}
+	if !reflect.DeepEqual(result.Columns, wantColumns) {
+		t.Fatalf("SELECT * columns = %v, want %v", result.Columns, wantColumns)
+	}
+	row := map[string]any{}
+	for index, column := range result.Columns {
+		row[column] = result.Rows[0][index]
+	}
+	if row["notes"] != "call [REDACTED_PHONE] or [REDACTED_EMAIL]" {
+		t.Fatalf("notes = %#v, want phone and email redacted", row["notes"])
+	}
+	if row["score"] != 5551234567.0 {
+		t.Fatalf("score = %#v, want numbers left alone by pattern detectors", row["score"])
+	}
+	if tags := fmt.Sprint(row["tags"]); !strings.Contains(tags, "[REDACTED_EMAIL]") || strings.Contains(tags, "ops@example.com") {
+		t.Fatalf("tags = %s, want the email inside the lookup redacted", tags)
+	}
+
+	for _, query := range []string{
+		"SELECT ssn FROM contacts",
+		"SELECT salary FROM contacts",
+		"SELECT name_2 FROM contacts",
+	} {
+		if _, err := service.QueryResolvedBase(ctx, "appPeople", query); err == nil {
+			t.Fatalf("%s succeeded; hidden fields must have no column", query)
+		}
+	}
+	metadata, err := service.QueryResolvedBase(ctx, "appPeople", "SELECT * FROM _metadata")
+	if err != nil {
+		t.Fatalf("SELECT * FROM _metadata returned error: %v", err)
+	}
+	if dump := fmt.Sprint(metadata.Rows); strings.Contains(dump, "SSN") || strings.Contains(dump, "Salary") || strings.Contains(dump, "fldName2") {
+		t.Fatalf("_metadata mentions a hidden field: %s", dump)
+	}
+
+	fingerprint, err := duckdb.ReadFieldPolicyFingerprint(ctx, service.DatabasePath("appPeople"))
+	if err != nil || fingerprint != policy.Fingerprint() {
+		t.Fatalf("cache fingerprint = %q (%v), want %q", fingerprint, err, policy.Fingerprint())
 	}
 }

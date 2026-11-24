@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/hackclub/better-airtable-mcp/internal/duckdb"
+	"github.com/hackclub/better-airtable-mcp/internal/fieldpolicy"
 	"github.com/hackclub/better-airtable-mcp/internal/logx"
 )
 
@@ -25,6 +26,8 @@ type Service struct {
 	syncSlots  chan struct{}
 	basesCache map[string]basesCacheEntry
 	now        func() time.Time
+
+	fieldPolicy *fieldpolicy.Policy
 }
 
 // baseListCacheTTL bounds how long a fetched base list is reused for base
@@ -97,6 +100,17 @@ func (s *Service) SetMaxConcurrentSyncs(limit int) {
 	s.syncSlots = make(chan struct{}, limit)
 }
 
+// SetFieldPolicy sets the field policy every sync applies. Call it before any
+// sync starts.
+func (s *Service) SetFieldPolicy(policy *fieldpolicy.Policy) {
+	s.fieldPolicy = policy
+}
+
+// FieldPolicy returns the field policy syncs apply (nil when none is set).
+func (s *Service) FieldPolicy() *fieldpolicy.Policy {
+	return s.fieldPolicy
+}
+
 // acquireSyncSlot waits for one of the process-wide sync slots.
 func (s *Service) acquireSyncSlot(ctx context.Context) (func(), error) {
 	select {
@@ -144,6 +158,30 @@ type syncPageResult struct {
 type syncTablePlan struct {
 	Table duckdb.TableSnapshot
 	Sort  ListRecordsPageOptions
+	// Redact holds the PII detectors for each redacted field, keyed by
+	// Airtable field name (the key records use).
+	Redact map[string]fieldpolicy.Detectors
+}
+
+// recordFields keeps only the plan's fields from an Airtable record and
+// redacts them, so hidden fields and raw PII never reach the cache.
+func (p syncTablePlan) recordFields(raw map[string]any) map[string]any {
+	fields := make(map[string]any, len(p.Table.Fields))
+	for _, field := range p.Table.Fields {
+		value, ok := raw[field.OriginalFieldName]
+		if !ok {
+			continue
+		}
+		if detectors := p.Redact[field.OriginalFieldName]; detectors != 0 {
+			value = detectors.Redact(value, isTextColumn(field.DuckDBType))
+		}
+		fields[field.OriginalFieldName] = value
+	}
+	return fields
+}
+
+func isTextColumn(duckdbType string) bool {
+	return duckdbType == "VARCHAR" || duckdbType == "VARCHAR[]" || duckdbType == "JSON"
 }
 
 type syncTableRuntime struct {
@@ -412,7 +450,14 @@ func (s *Service) runSync(ctx context.Context, tokens AccessTokenFunc, base Base
 		return SyncResult{}, err
 	}
 
-	plans, err := buildSyncPlans(tables)
+	if unmatched := s.fieldPolicy.UnmatchedKeys(base.ID, policyTableRefs(tables)); len(unmatched) > 0 {
+		logx.Event(ctx, "sync_service", "sync.field_policy_unmatched",
+			"base_id", base.ID,
+			"unmatched_count", len(unmatched),
+			"unmatched_keys", strings.Join(unmatched, ", "),
+		)
+	}
+	plans, err := buildSyncPlans(base.ID, tables, s.fieldPolicy)
 	if err != nil {
 		return SyncResult{}, err
 	}
@@ -446,6 +491,8 @@ func (s *Service) runSync(ctx context.Context, tokens AccessTokenFunc, base Base
 		BaseName:      base.Name,
 		Tables:        make([]duckdb.TableSnapshot, 0, len(plans)),
 		SyncStartedAt: startedAt,
+
+		FieldPolicyFingerprint: s.fieldPolicy.Fingerprint(),
 	}
 	for _, plan := range plans {
 		init.Tables = append(init.Tables, duckdb.TableSnapshot{
@@ -547,7 +594,7 @@ func (s *Service) runSync(ctx context.Context, tokens AccessTokenFunc, base Base
 						records = append(records, duckdb.RecordSnapshot{
 							ID:          record.ID,
 							CreatedTime: record.CreatedTime,
-							Fields:      record.Fields,
+							Fields:      runtime.Plan.recordFields(record.Fields),
 						})
 					}
 
@@ -764,7 +811,22 @@ func (s *Service) runSync(ctx context.Context, tokens AccessTokenFunc, base Base
 	return result, nil
 }
 
-func buildSyncPlans(tables []Table) ([]syncTablePlan, error) {
+func policyTableRefs(tables []Table) []fieldpolicy.TableRef {
+	refs := make([]fieldpolicy.TableRef, 0, len(tables))
+	for _, table := range tables {
+		ref := fieldpolicy.TableRef{ID: table.ID, Name: table.Name}
+		for _, field := range table.Fields {
+			ref.Fields = append(ref.Fields, fieldpolicy.FieldRef{ID: field.ID, Name: field.Name})
+		}
+		refs = append(refs, ref)
+	}
+	return refs
+}
+
+// buildSyncPlans maps the Airtable schema to DuckDB tables. Fields the policy
+// hides are dropped here, before column names are assigned, so they get no
+// column, no _metadata row, and no trace in the names of their neighbours.
+func buildSyncPlans(baseID string, tables []Table, policy *fieldpolicy.Policy) ([]syncTablePlan, error) {
 	tableNames := make([]string, 0, len(tables))
 	for _, table := range tables {
 		tableNames = append(tableNames, table.Name)
@@ -773,9 +835,17 @@ func buildSyncPlans(tables []Table) ([]syncTablePlan, error) {
 
 	plans := make([]syncTablePlan, 0, len(tables))
 	for tableIndex, table := range tables {
-		fieldNames := make([]string, 0, len(table.Fields))
-		sortFieldName := ""
+		tablePolicy := policy.Table(baseID, table.ID, table.Name)
+		visibleFields := make([]Field, 0, len(table.Fields))
 		for _, field := range table.Fields {
+			if !tablePolicy.Hidden(field.ID, field.Name) {
+				visibleFields = append(visibleFields, field)
+			}
+		}
+
+		fieldNames := make([]string, 0, len(visibleFields))
+		sortFieldName := ""
+		for _, field := range visibleFields {
 			mapping, ok := duckdb.AirtableTypeToDuckDBType(field.Type)
 			if ok && !mapping.Omitted {
 				fieldNames = append(fieldNames, field.Name)
@@ -788,8 +858,9 @@ func buildSyncPlans(tables []Table) ([]syncTablePlan, error) {
 		sanitizedFieldNames := duckdb.SanitizeFieldIdentifiers(fieldNames)
 
 		fields := make([]duckdb.FieldSnapshot, 0, len(fieldNames))
+		redact := map[string]fieldpolicy.Detectors{}
 		sanitizedIndex := 0
-		for _, field := range table.Fields {
+		for _, field := range visibleFields {
 			mapping, ok := duckdb.AirtableTypeToDuckDBType(field.Type)
 			if !ok || mapping.Omitted {
 				continue
@@ -802,6 +873,9 @@ func buildSyncPlans(tables []Table) ([]syncTablePlan, error) {
 				DuckDBType:        mapping.DuckDBType,
 			})
 			sanitizedIndex++
+			if detectors := tablePolicy.Detectors(field.ID, field.Name); detectors != 0 {
+				redact[field.Name] = detectors
+			}
 		}
 
 		plans = append(plans, syncTablePlan{
@@ -815,6 +889,7 @@ func buildSyncPlans(tables []Table) ([]syncTablePlan, error) {
 				SortFieldName: sortFieldName,
 				SortDirection: "desc",
 			},
+			Redact: redact,
 		})
 	}
 

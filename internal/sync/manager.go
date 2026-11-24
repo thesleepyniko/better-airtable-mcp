@@ -151,7 +151,15 @@ func (m *Manager) SweepStaleDuckDBFiles(ctx context.Context) error {
 
 		baseID := strings.TrimSuffix(entry.Name(), ".db")
 		if _, ok := activeBaseIDs[baseID]; ok {
-			continue
+			// The field policy only changes across restarts. A cache built
+			// under another policy (or one whose policy cannot be read) may
+			// hold fields or values the current one hides, so it is dropped
+			// and the restored worker rebuilds it.
+			fingerprint, err := duckdb.ReadFieldPolicyFingerprint(ctx, filepath.Join(m.service.dataDir, entry.Name()))
+			if err == nil && fingerprint == m.service.fieldPolicy.Fingerprint() {
+				continue
+			}
+			logx.Event(ctx, "sync_manager", "sync.field_policy_cache_discarded", "base_id", baseID)
 		}
 
 		if err := os.Remove(filepath.Join(m.service.dataDir, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {

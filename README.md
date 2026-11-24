@@ -114,5 +114,16 @@ Optional, with defaults:
 - `APPROVAL_TTL_MINUTES` (default `1440`, or 24 hours) - how long a pending approval stays valid
 - `QUERY_DEFAULT_LIMIT` (default `100`) and `QUERY_MAX_LIMIT` (default `1000`)
 - `SYNC_MAX_CONCURRENT` (default `4`) - how many base syncs may run at once; the rest queue for a slot
+- `FIELD_POLICY` (default none) - fields agents must never see or touch, and PII to redact from what they read. An inline JSON object or a path to a JSON file; see `SPEC.md` §4.7. Example:
+
+  ```json
+  {
+    "redact": ["email", "phone"],
+    "bases": {"appXXXXXXXXXXXXXX": {"tables": {"Contacts": {
+      "hidden_fields": ["SSN"],
+      "redact": {"Notes": ["all"], "Home Address": ["full"]}
+    }}}}
+  }
+  ```
 
 These match the defaults described in `SPEC.md`.

@@ -106,6 +106,9 @@ type SnapshotInit struct {
 	BaseName      string
 	Tables        []TableSnapshot
 	SyncStartedAt time.Time
+	// FieldPolicyFingerprint records the field policy the snapshot was built
+	// under, so a cache built under a different policy can be discarded.
+	FieldPolicyFingerprint string
 }
 
 type TableSyncState struct {
@@ -307,6 +310,11 @@ func initializeSnapshot(ctx context.Context, db *sql.DB, init SnapshotInit) erro
 
 	if err := createMetadataTables(ctx, tx); err != nil {
 		return err
+	}
+	if init.FieldPolicyFingerprint != "" {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO _field_policy (fingerprint) VALUES (?)`, init.FieldPolicyFingerprint); err != nil {
+			return fmt.Errorf("record field policy fingerprint: %w", err)
+		}
 	}
 	for _, table := range init.Tables {
 		if err := createDataTable(ctx, tx, table); err != nil {
@@ -608,6 +616,30 @@ func ReadSyncInfo(ctx context.Context, path string) (SyncInfo, error) {
 	return readSyncInfo(ctx, db)
 }
 
+// ReadFieldPolicyFingerprint returns the field policy fingerprint a snapshot
+// was built under; "" for no policy or a file from before policies existed.
+func ReadFieldPolicyFingerprint(ctx context.Context, path string) (string, error) {
+	db, err := openDatabase(path, "READ_ONLY")
+	if err != nil {
+		return "", err
+	}
+	defer db.Close()
+
+	exists, err := tableExists(ctx, db, "_field_policy")
+	if err != nil || !exists {
+		return "", err
+	}
+	var fingerprint string
+	err = db.QueryRowContext(ctx, `SELECT fingerprint FROM _field_policy LIMIT 1`).Scan(&fingerprint)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read field policy fingerprint: %w", err)
+	}
+	return fingerprint, nil
+}
+
 func ReadTableRowsByIDs(ctx context.Context, path, tableName string, ids []string) ([]map[string]any, error) {
 	db, err := openDatabase(path, "READ_ONLY")
 	if err != nil {
@@ -695,6 +727,9 @@ func createMetadataTables(ctx context.Context, tx *sql.Tx) error {
 			pages_fetched BIGINT,
 			records_synced_this_run BIGINT,
 			error VARCHAR
+		)`,
+		`CREATE TABLE _field_policy (
+			fingerprint VARCHAR
 		)`,
 		`CREATE TABLE _table_sync (
 			duckdb_table_name VARCHAR PRIMARY KEY,

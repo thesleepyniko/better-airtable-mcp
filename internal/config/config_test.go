@@ -111,6 +111,35 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 	}
 }
 
+func TestLoadFieldPolicy(t *testing.T) {
+	env := map[string]string{
+		"DATABASE_URL":           "postgres://localhost/better_airtable",
+		"AIRTABLE_CLIENT_ID":     "client-id",
+		"AIRTABLE_CLIENT_SECRET": "client-secret",
+		"BASE_URL":               "https://better-airtable-mcp.hackclub.com",
+		"APP_ENCRYPTION_KEY":     strings.Repeat("x", 32),
+	}
+
+	cfg, err := Load(testLookup(env))
+	if err != nil || cfg.FieldPolicy != nil {
+		t.Fatalf("expected no field policy by default, got %v / %v", cfg.FieldPolicy, err)
+	}
+
+	env["FIELD_POLICY"] = `{"bases":{"appA":{"tables":{"People":{"hidden_fields":["SSN"]}}}}}`
+	cfg, err = Load(testLookup(env))
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+	if !cfg.FieldPolicy.Table("appA", "tblPeople", "People").Hidden("fldSSN", "SSN") {
+		t.Fatal("expected the inline FIELD_POLICY to hide SSN")
+	}
+
+	env["FIELD_POLICY"] = `{"redact":["emial"]}`
+	if _, err := Load(testLookup(env)); err == nil || !strings.Contains(err.Error(), "FIELD_POLICY is invalid") {
+		t.Fatalf("expected an invalid FIELD_POLICY to fail startup, got %v", err)
+	}
+}
+
 func testLookup(values map[string]string) func(string) (string, bool) {
 	return func(key string) (string, bool) {
 		value, ok := values[key]

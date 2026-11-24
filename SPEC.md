@@ -252,6 +252,7 @@ recTask2,2026-04-01T13:15:00Z,QA revised layout
 - `total_record_count` is only authoritative after `table_complete=true`
 - `content[0].text` is organized as `sync_status`, `base`, `tables`, then one `# {duckdb_table_name}` CSV section per table using the queryable column names as headers (`id`, `created_time`, and sanitized Airtable field names)
 - The agent should call this before writing queries or mutations to understand the schema
+- Fields hidden by the field policy (§4.7) are absent from `tables[].fields`, the sample rows, and the text output; sample values are already PII-redacted
 
 ---
 
@@ -355,6 +356,7 @@ Design new homepage
 - If the base has no local snapshot yet, initializes schema immediately, starts a background sync, and executes against whatever subset is already visible instead of waiting for a full sync
 - During the very first sync, queries may legitimately return partial or zero-row results even though more data is still loading
 - DuckDB is hardened as if SQL is hostile: external file access disabled, extension install/load disabled, and arbitrary `ATTACH`, `COPY`, `INSTALL`, `LOAD`, and `PRAGMA` statements rejected
+- The field policy (§4.7) is enforced in the cache itself: hidden fields have no column, so `SELECT *` omits them and naming one directly fails as an unknown column; redacted fields hold only redacted values, so no SQL expression can recover the original
 
 **SQL examples:**
 
@@ -469,6 +471,8 @@ For `delete_records`, `records` may be either objects containing `id` or plain A
 - If a later batch fails after earlier batches succeeded, the operation status becomes `partially_completed` and the result includes which batches/records succeeded before the failure
 - After approval, executes against the Airtable API using the requesting user's Airtable token, never a shared sync token
 - After execution, partial completion, or failure, triggers an immediate base sync
+- Fields hidden by the field policy (§4.7) do not resolve by column name, original name, or Airtable field ID; the request fails as an unknown field and the suggestions list only visible fields
+- Rejects any field value containing a redaction placeholder (`[REDACTED]`, `[REDACTED_EMAIL]`, …): the cache only holds redacted copies, so writing one back would overwrite the real Airtable data
 
 ---
 
@@ -603,6 +607,9 @@ field to "deprecated" and calls it a deletion).
 - On approval, executes one meta API call per operation, sequentially, using the
   requesting user's Airtable token. A mid-sequence failure yields `partially_completed`.
 - Schema changes restructure the base, so execution triggers a full base re-sync.
+- Hidden fields (§4.7) cannot be referenced. Renaming a table the field policy names, or a field it names
+  specifically (hidden or with a field-level redaction rule), is refused: a rename would silently detach
+  a name-keyed rule. Description-only edits are allowed.
 
 **Output:**
 ```json
@@ -707,6 +714,13 @@ CREATE TABLE _sync_info (
 );
 ```
 
+**Field policy table** (`_field_policy`): one row holding the fingerprint of the field policy (§4.7) the snapshot was built under; empty when no policy is configured.
+```sql
+CREATE TABLE _field_policy (
+  fingerprint VARCHAR
+);
+```
+
 **Per-table sync table** (`_table_sync`):
 ```sql
 CREATE TABLE _table_sync (
@@ -781,6 +795,57 @@ DuckDB files are **shared across all users** who have access to the same base fo
 - DuckDB concurrent access: one write connection (sync worker), multiple read-only connections (query handlers)
 - During the first sync of a base, reads use the active partial snapshot
 - During a refresh of an already-complete base, reads stay on the last complete snapshot until the staging refresh finishes successfully
+
+### 4.7 Field Policy (Field Gating and PII Redaction)
+
+The server operator can keep specific fields away from agents entirely and redact PII from the values agents read. The policy is set with `FIELD_POLICY` (§9): an inline JSON object, or a path to a JSON file.
+
+```json
+{
+  "redact": ["email", "phone"],
+  "bases": {
+    "appXXXXXXXXXXXXXX": {
+      "tables": {
+        "Contacts": {
+          "hidden_fields": ["SSN", "fldXXXXXXXXXXXXXX"],
+          "redact": {
+            "Notes": ["all"],
+            "Home Address": ["full"],
+            "*": ["credit_card"]
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+- **Keys**: bases are keyed by base ID. Tables and fields match by Airtable ID or, case-insensitively, by name; every matching table entry applies. IDs survive renames in Airtable, so prefer them.
+- **`hidden_fields`** (field gating): the sync drops these fields from the schema before DuckDB columns are named, and drops their values from every fetched record before anything is written. They get no column, no `_metadata` row, and leave no gap in neighbouring column names, so `list_schema`, `query` (including `SELECT *`), `mutate`, `manage_schema`, and the approval preview never see them.
+- **`redact`** (PII redaction): detectors apply to every value written to the cache. Effective detectors for a field are the union of the top-level `redact` list (every field of every base), the table's `"*"` rule, and the field's own rule.
+
+| Detector | Replaces with | Matches |
+|---|---|---|
+| `email` | `[REDACTED_EMAIL]` | Email addresses |
+| `phone` | `[REDACTED_PHONE]` | North American numbers in common formats; `+`-prefixed international numbers |
+| `ssn` | `[REDACTED_SSN]` | `123-45-6789` |
+| `credit_card` | `[REDACTED_CREDIT_CARD]` | 13–19 digit numbers that pass the Luhn check |
+| `ip_address` | `[REDACTED_IP_ADDRESS]` | IPv4 addresses |
+| `all` | — | All of the above |
+| `full` | `[REDACTED]` | The whole value: for free text whose PII (names, addresses) no pattern finds. Text, select, lookup, and JSON columns get `[REDACTED]`; number, date, and checkbox columns get `NULL` |
+
+**Behavior:**
+- Redaction runs on strings, including those nested in lookups, attachments, and collaborator objects; numbers, booleans, and object keys are left alone by pattern detectors.
+- Redaction happens at sync time, not when results are returned, so SQL cannot undo it (`replace(email, '@', ' at ')` only sees the placeholder). The cost is that the approval preview's current values are redacted too.
+- Unknown keys, unknown detectors, and non-`app` base keys fail startup, so a typo cannot silently expose a field. Policy keys that match no table or field in a synced base are logged on every sync as `sync.field_policy_unmatched`.
+- Each snapshot records the policy fingerprint in `_field_policy`. At startup the stale-file sweep also deletes active caches built under a different policy (or whose policy cannot be read), and the restored worker rebuilds them under the current one.
+- `mutate` refuses values containing redaction placeholders, and `manage_schema` refuses to rename policy-covered tables and fields (§3.4, §3.7).
+- The policy is per deployment, matching the shared per-base cache (§4.6): it applies to every user of the base.
+
+**Limits:**
+- Formula, lookup, and rollup fields that read a hidden field can still expose its value; hide or redact them too.
+- Pattern detection is best-effort and cannot find names or postal addresses; use `full` for those fields.
+- Deleting a record removes its hidden fields' values along with it.
 
 ---
 
@@ -996,6 +1061,7 @@ CREATE TABLE oauth_clients (
 - Server logs must never include OAuth authorization codes, OAuth state values, PKCE verifiers, client secrets, raw request bodies, raw query strings, Airtable request bodies, raw approval URLs, or raw approval `op_...` identifiers
 - Structured logging for mutation requests must log only IDs, counts, hashes, statuses, and sanitized previews; it must never log decrypted field values or approval payload contents
 - Approval previews are decrypted only for the specific HTTP request serving the approval page
+- Fields hidden by the field policy are never written to DuckDB, and redacted fields are stored only in redacted form (§4.7)
 
 ### 6.2 Observability and Logging
 
@@ -1083,6 +1149,9 @@ better-airtable-mcp/
 │   │   └── cryptoutil.go        # Application-layer encryption helpers
 │   ├── db/
 │   │   └── postgres.go          # Postgres connection, migrations, and store methods
+│   ├── fieldpolicy/
+│   │   ├── policy.go            # FIELD_POLICY parsing, matching, and fingerprint
+│   │   └── redact.go            # PII detectors and value redaction
 │   ├── duckdb/
 │   │   ├── schema.go            # Table name sanitization and type mapping
 │   │   └── store.go             # DuckDB snapshot storage operations
@@ -1167,6 +1236,7 @@ All configuration via environment variables:
 | `QUERY_DEFAULT_LIMIT` | Default row limit for queries | `100` |
 | `QUERY_MAX_LIMIT` | Maximum row limit for queries | `1000` |
 | `SYNC_MAX_CONCURRENT` | Maximum base syncs running at once across the process; others wait for a slot | `4` |
+| `FIELD_POLICY` | Field gating and PII redaction policy (§4.7): inline JSON object, or path to a JSON file | none |
 
 ---
 
@@ -1193,6 +1263,7 @@ All configuration via environment variables:
 | **Staging refreshes after the first complete snapshot** | Keeps existing readers on a full snapshot while a refresh is in flight |
 | **Records-only mutations in V1** | Keeps the approval flow and executor focused on the core use case |
 | **Encrypt sensitive state at rest** | Protects third-party tokens and pending mutation payloads stored in Postgres |
+| **Field policy enforced at sync time** | Hidden fields and raw PII never enter the cache, so no tool or SQL expression can reach them; output-time filtering would be bypassable through SQL |
 
 ---
 
@@ -1238,6 +1309,8 @@ All configuration via environment variables:
 | Mutate approved but Airtable API fails after one or more batches succeed | Operation status → `partially_completed`; include partial result details and stop on first failed Airtable request |
 | DuckDB file missing (post-redeploy) | Triggers fresh sync transparently |
 | DuckDB file unreadable by this build (newer storage version after a rollback, or not a DuckDB file) | The next sync deletes it and rebuilds it from Airtable |
+| `FIELD_POLICY` invalid (bad JSON, unknown key or detector, missing file) | Startup fails with a configuration error |
+| DuckDB file built under a different field policy | Deleted by the startup sweep and rebuilt by the next sync |
 
 ---
 

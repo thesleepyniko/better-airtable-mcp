@@ -16,6 +16,7 @@ import (
 	"github.com/hackclub/better-airtable-mcp/internal/cryptoutil"
 	"github.com/hackclub/better-airtable-mcp/internal/db"
 	"github.com/hackclub/better-airtable-mcp/internal/duckdb"
+	"github.com/hackclub/better-airtable-mcp/internal/fieldpolicy"
 	"github.com/hackclub/better-airtable-mcp/internal/logx"
 	syncer "github.com/hackclub/better-airtable-mcp/internal/sync"
 )
@@ -347,6 +348,9 @@ func (s *Service) PrepareMutation(ctx context.Context, userID string, request Mu
 					return fail(fmt.Errorf("field %q duplicates %q on table %q; use one reference per Airtable field", fieldName, priorName, table.DuckDBTableName))
 				}
 				resolvedFieldKeys[fieldKey] = fieldName
+				if fieldpolicy.ContainsPlaceholder(value) {
+					return fail(fmt.Errorf("field %q on table %q contains a redaction placeholder such as [REDACTED_EMAIL]; the cache only holds redacted values, so writing one back would overwrite the real data in Airtable. Send the complete intended value or leave the field out", fieldName, table.DuckDBTableName))
+				}
 				resolvedRecord.AirtableFields[field.OriginalName] = value
 			}
 
